@@ -1,0 +1,55 @@
+[build-system]
+requires = ['hatchling']
+build-backend = 'hatchling.build'
+
+[project]
+name = 'vulnamer'
+version = '0.0.0'
+authors = [{ name = 'FreeLabz', email = 'sales@freelabz.com' }]
+readme = 'README.md'
+description = 'Turn CVEs into short, human-readable vulnerability names.'
+requires-python = '>=3.10'
+license = 'MIT'
+license-files = ['LICENSE']
+keywords = ['cve', 'cybersecurity', 'kev', 'nuclei', 'vulnerability']
+classifiers = [
+  'Development Status :: 3 - Alpha',
+  'Intended Audience :: Developers',
+  'Intended Audience :: Information Technology',
+  'Operating System :: OS Independent',
+  'Programming Language :: Python',
+  'Programming Language :: Python :: 3',
+  'Programming Language :: Python :: 3.10',
+  'Programming Language :: Python :: 3.11',
+  'Programming Language :: Python :: 3.12',
+  'Programming Language :: Python :: 3.13',
+  'Topic :: Security',
+]
+dependencies = []
+
+[project.optional-dependencies]
+model = ['numpy < 3', 'onnxruntime < 2', 'tokenizers < 1']
+dev = ['hatch < 2', 'ruff < 1']
+
+[project.scripts]
+vulnamer = 'vulnamer:main'
+
+[project.urls]
+Homepage = 'https://github.com/freelabz/vulnamer'
+Issues = 'https://github.com/freelabz/vulnamer/issues'
+
+[tool.hatch.build.targets.wheel]
+only-include = ['vulnamer.py']
+
+[tool.hatch.build.targets.sdist]
+include = ['vulnamer.py', 'tests', 'LICENSE', 'README.md', 'MODEL_CARD.md', 'CHANGELOG.md']
+
+[tool.ruff]
+line-length = 130
+target-version = 'py310'
+
+[tool.ruff.lint]
+select = ['E', 'F', 'I']
+
+[tool.ruff.lint.per-file-ignores]
+'tests/*' = ['E501']

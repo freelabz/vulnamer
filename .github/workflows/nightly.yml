@@ -1,0 +1,36 @@
+name: Update names dataset
+on:
+  schedule:
+    - cron: "15 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install ".[model]"
+      - name: Fetch model and the previous dataset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download model-v1 --pattern 'vulnamer-model.tar.gz'
+          mkdir model && tar -xzf vulnamer-model.tar.gz -C model
+          gh release download dataset --pattern 'vuln_names.jsonl.gz' --output previous.jsonl.gz || true
+      - name: Build
+        run: |
+          PREVIOUS=""
+          if [ -f previous.jsonl.gz ]; then PREVIOUS="--previous previous.jsonl.gz"; fi
+          vulnamer build vuln_names.jsonl.gz --model model $PREVIOUS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload dataset vuln_names.jsonl.gz --clobber

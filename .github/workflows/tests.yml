@@ -1,0 +1,54 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install "ruff<1"
+      - run: ruff check .
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.x"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install .
+      - run: python -m unittest discover tests
+
+  model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install ".[model]"
+      - name: Fetch model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download model-v1 --pattern 'vulnamer-model.tar.gz'
+          mkdir model && tar -xzf vulnamer-model.tar.gz -C model
+      - name: Run tests against the real model
+        env:
+          VULNAMER_MODEL: model
+        run: python -m unittest discover tests

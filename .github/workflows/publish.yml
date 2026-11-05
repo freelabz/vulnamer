@@ -1,0 +1,27 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - v*.*.*
+
+permissions:
+  contents: read
+
+jobs:
+  publish-pypi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install hatch
+        run: pip install "hatch<2"
+      - name: Build PyPI package
+        run: hatch build
+      - name: Publish PyPI package
+        run: hatch publish
+        env:
+          HATCH_INDEX_USER: __token__
+          HATCH_INDEX_AUTH: ${{ secrets.PYPI_TOKEN }}
