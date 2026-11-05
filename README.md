@@ -21,6 +21,9 @@ uv add vulnamer                 # in a uv project
 uv tool install vulnamer        # just the CLI
 ```
 
+The `model` extra needs a Python version that `onnxruntime` publishes wheels for. It may
+not be available yet on the newest Python release. The base package has no such limit.
+
 ## Three ways to use it
 
 **Use the dataset.** This is the simplest option and needs no ML dependencies. The
