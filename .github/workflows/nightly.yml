@@ -29,8 +29,8 @@ jobs:
         run: |
           PREVIOUS=""
           if [ -f previous.jsonl.gz ]; then PREVIOUS="--previous previous.jsonl.gz"; fi
-          vulnamer build vuln_names.jsonl.gz --model model $PREVIOUS
+          vulnamer build vuln_names.jsonl.gz --names vuln_names.min.jsonl.gz --model model $PREVIOUS
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload dataset vuln_names.jsonl.gz --clobber
+        run: gh release upload dataset vuln_names.jsonl.gz vuln_names.min.jsonl.gz --clobber

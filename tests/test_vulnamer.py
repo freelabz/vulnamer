@@ -2,11 +2,13 @@ import gzip
 import io
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import vulnamer as V  # noqa: E402
@@ -361,6 +363,52 @@ class TestBuildDataset(unittest.TestCase):
         self.assertEqual(rows["CVE-1"]["source"], "model")
         self.assertEqual(rows["CVE-2"]["source"], "cna")
 
+    def test_curated_name_that_stopped_applying_reaches_the_model(self):
+        description = "Foo has an odd flaw."
+        previous = {
+            "CVE-1": {
+                "name": "Foo Advisory Title",
+                "source": "ghsa",
+                "description_hash": V.description_hash(description),
+            }
+        }
+        namer = FakeNamer("Foo - Odd Flaw")
+        rows = list(V.build_dataset([("CVE-1", description, "")], {}, {}, {}, {}, namer, previous))
+        self.assertEqual(namer.calls, [description])
+        self.assertEqual(rows[0]["source"], "model")
+
+    def test_model_names_one_description_at_a_time(self):
+        class OneAtATime(FakeNamer):
+            def name(self, descriptions):
+                assert len(descriptions) == 1
+                return super().name(descriptions)
+
+        records = [(f"CVE-{n}", f"Foo{n} has an odd flaw.", "") for n in range(3)]
+        rows = list(V.build_dataset(records, {}, {}, {}, {}, OneAtATime("Foo - Odd Flaw")))
+        self.assertEqual([row["id"] for row in rows], ["CVE-0", "CVE-1", "CVE-2"])
+
+    def test_names_file_keeps_only_what_a_lookup_needs(self):
+        full = {
+            "id": "CVE-1",
+            "name": "Foo - Odd Flaw",
+            "source": "model",
+            "public_name": "FooShell",
+            "description_hash": "abc",
+        }
+        self.assertEqual(
+            V.names_entry(full),
+            {"id": "CVE-1", "name": "Foo - Odd Flaw", "public_name": "FooShell"},
+        )
+        self.assertEqual(
+            V.names_entry({"id": "CVE-2", "name": "Foo - Odd Flaw", "source": "cna"}),
+            {"id": "CVE-2", "name": "Foo - Odd Flaw"},
+        )
+        self.assertEqual(
+            V.names_entry({"id": "CVE-3", "name": None, "public_name": "FooShell"}),
+            {"id": "CVE-3", "public_name": "FooShell"},
+        )
+        self.assertIsNone(V.names_entry({"id": "CVE-4", "name": None, "source": None}))
+
     def test_unchanged_description_reuses_earlier_output(self):
         namer = FakeNamer("New output")
         previous = {
@@ -637,6 +685,84 @@ class TestKernelThroughThePipeline(unittest.TestCase):
 @unittest.skipUnless(
     os.environ.get("VULNAMER_MODEL"), "set VULNAMER_MODEL to the exported model"
 )
+class TestVendorNames(unittest.TestCase):
+    def test_keeps_vendor_titles(self):
+        for title in (
+            "Windows Kernel Information Disclosure",
+            "cloneNode Remote Code Execution",
+            "iSNS Server Memory Corruption",
+        ):
+            description = f"A flaw in Windows and iSNS, aka '{title}'."
+            self.assertEqual(V.vendor_name(description), title)
+
+    def test_rejects_phrases_that_are_not_titles(self):
+        for phrase in (
+            "the second issue",
+            "unsigned long long[18]",
+            "Keyboard Layout",
+            "registered user privilege escalation",
+        ):
+            self.assertIsNone(V.vendor_name(f"A flaw in Keyboard handling, aka '{phrase}'."))
+
+    def test_rejected_phrase_falls_through_to_the_model(self):
+        description = "Foo Server has a buffer overflow, aka 'the second issue'."
+        result = V.resolve_name(description, namer=FakeNamer("Foo Server - Buffer Overflow"))
+        self.assertEqual(result.source, "model")
+
+
+class TestModelDownload(unittest.TestCase):
+    def setUp(self):
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.archive = os.path.join(self.work.name, "model.tar.gz")
+        with tarfile.open(self.archive, "w:gz") as tar:
+            for name in (*V.MODEL_FILES, "../outside"):
+                data = name.encode()
+                info = tarfile.TarInfo(f"./{name}")
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        self.target = os.path.join(self.work.name, "cache", "model")
+        self.downloads = 0
+
+    def fake_download(self, url, directory):
+        self.downloads += 1
+        path = os.path.join(directory, "download")
+        shutil.copyfile(self.archive, path)
+        return path
+
+    def download(self, checksum=None):
+        checksum = checksum or V._sha256(self.archive)
+        with mock.patch.object(V, "_download", self.fake_download):
+            with mock.patch.object(V, "MODEL_SHA256", checksum):
+                return V.download_model(self.target)
+
+    def test_unpacks_only_the_model_files(self):
+        self.assertEqual(self.download(), self.target)
+        self.assertEqual(sorted(os.listdir(self.target)), sorted(V.MODEL_FILES))
+        self.assertEqual(os.listdir(os.path.dirname(self.target)), ["model"])
+        self.assertFalse(os.path.exists(os.path.join(self.work.name, "cache", "outside")))
+
+    def test_second_call_does_not_download_again(self):
+        self.download()
+        self.download()
+        self.assertEqual(self.downloads, 1)
+
+    def test_a_bad_checksum_leaves_nothing_behind(self):
+        with self.assertRaises(ValueError):
+            self.download("0" * 64)
+        self.assertEqual(os.listdir(os.path.dirname(self.target)), [])
+
+    def test_cache_follows_xdg_cache_home(self):
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/somewhere"}):
+            self.assertEqual(
+                V.default_model_dir(), os.path.join("/somewhere", "vulnamer", V.MODEL_VERSION)
+            )
+
+    def test_published_model_checksum_is_pinned(self):
+        self.assertRegex(V.MODEL_SHA256, r"^[0-9a-f]{64}$")
+        self.assertIn(V.MODEL_VERSION, V.MODEL_URL)
+
+
 class TestRealModel(unittest.TestCase):
     """Runs the exported ONNX model. Needs the ``model`` extra."""
 
@@ -660,6 +786,23 @@ class TestRealModel(unittest.TestCase):
         alone = self.namer.generate([description])[0]
         batched = self.namer.generate([description, "A much longer description. " * 30])[0]
         self.assertEqual(alone, batched)
+
+    def test_a_name_does_not_depend_on_its_neighbours(self):
+        # real descriptions whose name changed with the batch before each ran alone
+        descriptions = [
+            "A NULL pointer dereference (DoS) Vulnerability was found in the function "
+            "aubio_source_avcodec_readframe in io/source_avcodec.c of aubio 0.4.6, which may "
+            "lead to DoS when playing a crafted audio file.",
+            "All versions of package realms-shim are vulnerable to Sandbox Bypass via a "
+            "Prototype Pollution attack vector.",
+            "nexkey is a microblogging platform. Insufficient validation of ActivityPub requests "
+            "received in inbox could allow any user to impersonate another user in certain "
+            "circumstances. This issue has been patched in version 12.122.2.",
+        ]
+        alone = [self.namer.generate([text])[0] for text in descriptions]
+        filler = "Another description. " * 40
+        together = [self.namer.generate([text, filler])[0] for text in descriptions]
+        self.assertEqual(alone, together)
 
     def test_resolves_through_the_model_tier(self):
         result = V.resolve_name("SQL injection in AcmeShop 2.1 login.", namer=self.namer)

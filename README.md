@@ -51,13 +51,31 @@ result = resolve_name(
 print(result.name, result.source, result.public_name)
 ```
 
-**Run the model.** Install the `model` extra, download the model from the
-[`model-v1` release](https://github.com/freelabz/vulnamer/releases/tag/model-v1) and pass
-its directory:
+**Run the model.** Install the `model` extra. The first call downloads the
+[`model-v1` release](https://github.com/freelabz/vulnamer/releases/tag/model-v1), checks its
+SHA-256 and caches it:
+
+```python
+from vulnamer import ModelNamer, resolve_name
+
+namer = ModelNamer.load()  # ModelNamer.load(download=False) never touches the network
+print(resolve_name("SQL injection in the login form of AcmeShop 2.1.", namer=namer).name)
+```
+
+From the command line:
 
 ```bash
+vulnamer download-model ./model
 vulnamer name "SQL injection in the login form of AcmeShop 2.1." --model ./model
 ```
+
+The same description always gives the same name. The model runs one description at a time,
+because its int8 quantization would otherwise let a name depend on the rest of a batch.
+
+**Look names up.** `NAMES_URL` points to a smaller, names-only dataset with the fields `id`,
+`name` and `public_name`, for when you don't need the source of each name. `DATASET_URL`
+points to the full one. Both are gzipped JSON lines, rebuilt nightly, and `read_dataset`
+reads either.
 
 ## How a name is chosen
 
