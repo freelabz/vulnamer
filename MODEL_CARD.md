@@ -10,7 +10,7 @@ It is a fallback, used only when no curated name exists.
 | Format | int8-quantized ONNX: encoder 11.2 MB, decoder 20.4 MB, tokenizer 2.4 MB |
 | Decoding | Greedy, at most 32 new tokens, source truncated to 128 tokens |
 | Runtime | `onnxruntime`, `tokenizers`, `numpy`. CPU only. |
-| Speed | 24.5 descriptions/s on 4 CPU threads of a Ryzen 7 5800H that was also busy with GPU training |
+| Speed | 25 ms median, 71 ms p95 per description on 4 CPU threads of a Ryzen 7 5800H that was also running other work |
 
 ## Training
 

@@ -23,6 +23,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -39,6 +40,11 @@ except PackageNotFoundError:  # the file was copied rather than installed
     __version__ = "0.0.0+unknown"
 
 DATASET_URL = "https://github.com/freelabz/vulnamer/releases/download/dataset/vuln_names.jsonl.gz"
+NAMES_URL = "https://github.com/freelabz/vulnamer/releases/download/dataset/vuln_names.min.jsonl.gz"
+MODEL_VERSION = "model-v1"
+MODEL_URL = f"https://github.com/freelabz/vulnamer/releases/download/{MODEL_VERSION}/vulnamer-model.tar.gz"
+MODEL_SHA256 = "e3fed2d680bad13454020b66da624ac0e7c753d53cae6bc8cd376a69595573c2"
+MODEL_FILES = ("encoder_model.onnx", "decoder_model.onnx", "tokenizer.json")
 
 NUCLEI_CVES_URL = (
     "https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/cves.json"
@@ -51,6 +57,7 @@ HTTP_TIMEOUT = 120
 
 MIN_NAME_LENGTH = 12
 MAX_NAME_LENGTH = 110
+MIN_VENDOR_NAME_WORDS = 3
 
 # Words describing the flaw rather than the affected product.
 VULN_WORDS = frozenset("""
@@ -205,7 +212,15 @@ def clean_name(raw: Optional[str], description: str = "") -> Optional[str]:
 def vendor_name(description: str) -> Optional[str]:
     """Extract the title some vendors embed in descriptions as ``aka '<title>'``."""
     match = _VENDOR_AKA_RE.search(description or "")
-    return clean_name(match.group(1), description) if match else None
+    name = clean_name(match.group(1), description) if match else None
+    if not name:
+        return None
+    # "aka" also introduces plain phrases: "the second issue", "unsigned int[5]",
+    # "Keyboard Layout". Vendor titles name a product and a flaw in title case.
+    words = name.split()
+    if len(words) < MIN_VENDOR_NAME_WORDS or words[0].islower():
+        return None
+    return name
 
 
 # Canonical flaw names, most specific first.
@@ -708,41 +723,48 @@ class ModelNamer:
         )
         self._tokenizer = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
         self._tokenizer.enable_truncation(max_length=self.MAX_SOURCE_TOKENS)
-        self._tokenizer.enable_padding(pad_id=self.PAD_ID)
+
+    @classmethod
+    def load(cls, threads: Optional[int] = None, download: bool = True) -> "ModelNamer":
+        """Load the published model from the cache, downloading it if it is missing.
+
+        With ``download=False`` nothing touches the network, and a missing model
+        raises an error from ``onnxruntime``.
+        """
+        return cls(download_model() if download else default_model_dir(), threads)
 
     def generate(self, descriptions: Sequence[str]) -> List[str]:
-        """Return the raw model output for a batch of descriptions."""
+        """Return the raw model output for each description.
+
+        Descriptions are always run one at a time. The int8 model scales its input
+        from the whole tensor, so batching would make a name depend on its neighbours.
+        """
+        return [self._generate_one(description) for description in descriptions]
+
+    def _generate_one(self, description: str) -> str:
         numpy = self._numpy
-        encoded = self._tokenizer.encode_batch(
-            [self.PREFIX + _collapse(text) for text in descriptions]
-        )
-        input_ids = numpy.array([item.ids for item in encoded], dtype=numpy.int64)
-        attention_mask = numpy.array(
-            [item.attention_mask for item in encoded], dtype=numpy.int64
-        )
+        encoded = self._tokenizer.encode(self.PREFIX + _collapse(description))
+        input_ids = numpy.array([encoded.ids], dtype=numpy.int64)
+        attention_mask = numpy.array([encoded.attention_mask], dtype=numpy.int64)
         hidden = self._encoder.run(
             None, {"input_ids": input_ids, "attention_mask": attention_mask}
         )[0]
 
-        batch_size = len(descriptions)
-        decoded = numpy.full((batch_size, 1), self.PAD_ID, dtype=numpy.int64)
-        finished = numpy.zeros(batch_size, dtype=bool)
+        decoded = [self.PAD_ID]
         for _ in range(self.MAX_NEW_TOKENS):
             logits = self._decoder.run(
                 None,
                 {
-                    "input_ids": decoded,
+                    "input_ids": numpy.array([decoded], dtype=numpy.int64),
                     "encoder_attention_mask": attention_mask,
                     "encoder_hidden_states": hidden,
                 },
             )[0]
-            next_ids = logits[:, -1].argmax(axis=-1)
-            next_ids = numpy.where(finished, self.PAD_ID, next_ids)
-            decoded = numpy.concatenate([decoded, next_ids[:, None]], axis=1)
-            finished |= next_ids == self.EOS_ID
-            if finished.all():
+            next_id = int(logits[0, -1].argmax())
+            if next_id == self.EOS_ID:
                 break
-        return self._tokenizer.decode_batch(decoded[:, 1:].tolist(), skip_special_tokens=True)
+            decoded.append(next_id)
+        return self._tokenizer.decode(decoded[1:], skip_special_tokens=True)
 
     def name(self, descriptions: Sequence[str]) -> List[Optional[str]]:
         """Return checked names, with None where the output was not trustworthy."""
@@ -891,6 +913,51 @@ def iter_poc_references(path: str) -> Iterator[Tuple[str, str]]:
                     yield base[: -len(".json")], url
 
 
+def default_model_dir() -> str:
+    """Return where the published model is cached."""
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(cache, "vulnamer", MODEL_VERSION)
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_model(directory: Optional[str] = None) -> str:
+    """Fetch the published model, verify it and return its directory.
+
+    Does nothing if the model is already there. Files appear all at once, so an
+    interrupted download or a concurrent process never leaves a partial model.
+    """
+    target = directory or default_model_dir()
+    if all(os.path.isfile(os.path.join(target, name)) for name in MODEL_FILES):
+        return target
+    parent = os.path.dirname(os.path.abspath(target))
+    os.makedirs(parent, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=parent) as work_dir:
+        archive = _download(MODEL_URL, work_dir)
+        checksum = _sha256(archive)
+        if checksum != MODEL_SHA256:
+            raise ValueError(f"model checksum mismatch: got {checksum}")
+        unpacked = os.path.join(work_dir, "model")
+        os.mkdir(unpacked)
+        with tarfile.open(archive, "r:gz") as tar:
+            for name in MODEL_FILES:  # by name, so the archive cannot write anywhere else
+                with tar.extractfile(f"./{name}") as source:
+                    with open(os.path.join(unpacked, name), "wb") as output:
+                        shutil.copyfileobj(source, output)
+        try:
+            os.replace(unpacked, target)
+        except OSError:  # a concurrent process finished first
+            if not os.path.isfile(os.path.join(target, MODEL_FILES[0])):
+                raise
+    return target
+
+
 def description_hash(description: str) -> str:
     """Identify a description, to reuse earlier model output when it is unchanged."""
     return hashlib.sha256(_collapse(description).encode("utf-8", "replace")).hexdigest()[:16]
@@ -902,6 +969,14 @@ def read_dataset(path: str) -> Dict[str, dict]:
         return {entry["id"]: entry for entry in map(json.loads, lines)}
 
 
+def names_entry(result: dict) -> Optional[dict]:
+    """Reduce a dataset row to what a lookup needs, or None if it has no name at all."""
+    if not result.get("name") and not result.get("public_name"):
+        return None
+    keys = ("id", "name", "public_name")
+    return {key: result[key] for key in keys if result.get(key)}
+
+
 def build_dataset(
     records: Iterable[Tuple[str, str, str]],
     nuclei: Dict[str, str],
@@ -910,11 +985,9 @@ def build_dataset(
     public_names: Dict[str, str],
     namer: Optional[ModelNamer] = None,
     previous: Optional[Dict[str, dict]] = None,
-    batch_size: int = 64,
 ) -> Iterator[dict]:
     """Resolve names for all records, running the model only where it is needed."""
     previous = previous or {}
-    pending: List[Tuple[str, str, str]] = []
 
     def entry(cve_id, description, title, generated=None):
         resolved = resolve_name(
@@ -933,19 +1006,15 @@ def build_dataset(
         result["description_hash"] = description_hash(description)
         return result
 
-    def flush():
-        generated = namer.name([item[1] for item in pending])
-        for (cve_id, description, title), name in zip(pending, generated):
-            yield entry(cve_id, description, title, name or "")
-        pending.clear()
-
     for cve_id, description, title in records:
         result = entry(cve_id, description, title)
         if result["source"] not in (None, "heuristic") or not namer or not description:
             yield result
             continue
         earlier = previous.get(cve_id)
-        if earlier and earlier.get("description_hash") == result["description_hash"]:
+        unchanged = earlier and earlier.get("description_hash") == result["description_hash"]
+        # a curated name that no longer applies says nothing about the model's output
+        if unchanged and earlier.get("source") in ("model", "heuristic", None):
             reused = earlier.get("source") == "model" and check_generated_name(
                 earlier["name"], description
             )
@@ -953,11 +1022,7 @@ def build_dataset(
                 result.update(name=reused, source="model")
             yield result
             continue
-        pending.append((cve_id, description, title))
-        if len(pending) >= batch_size:
-            yield from flush()
-    if pending:
-        yield from flush()
+        yield entry(cve_id, description, title, namer.name([description])[0] or "")
 
 
 def _build_command(args: argparse.Namespace) -> int:
@@ -981,15 +1046,21 @@ def _build_command(args: argparse.Namespace) -> int:
         namer = ModelNamer(args.model, args.threads) if args.model else None
         previous = read_dataset(args.previous) if args.previous else None
         counts: Counter = Counter()
+        names = gzip.open(args.names, "wt", encoding="utf-8") if args.names else None
         with gzip.open(args.output, "wt", encoding="utf-8") as output:
             for result in build_dataset(
                 iter_cvelist(cvelist), nuclei, kev, ghsa, public_names, namer, previous
             ):
                 output.write(json.dumps(result, ensure_ascii=False) + "\n")
+                reduced = names_entry(result)
+                if names and reduced:
+                    names.write(json.dumps(reduced, ensure_ascii=False) + "\n")
                 counts[result["source"]] += 1
                 done = sum(counts.values())
                 if done % 20000 == 0:
                     print(f"[+] {done} records: {dict(counts)}", file=sys.stderr, flush=True)
+        if names:
+            names.close()
         print(f"[+] Wrote {sum(counts.values())} names: {dict(counts)}", file=sys.stderr)
     return 0
 
@@ -998,6 +1069,11 @@ def _name_command(args: argparse.Namespace) -> int:
     namer = ModelNamer(args.model, args.threads) if args.model else None
     resolved = resolve_name(args.description, args.cve or "", namer=namer)
     print(json.dumps(resolved.__dict__, ensure_ascii=False))
+    return 0
+
+
+def _download_model_command(args: argparse.Namespace) -> int:
+    print(download_model(args.directory))
     return 0
 
 
@@ -1017,8 +1093,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     build.add_argument("output", help="output file (.jsonl.gz)")
     build.add_argument("--model", help="directory of the ONNX model")
     build.add_argument("--previous", help="earlier dataset, to reuse model output")
+    build.add_argument("--names", help="also write a smaller, names-only file (.jsonl.gz)")
     build.add_argument("--threads", type=int)
     build.set_defaults(run=_build_command)
+
+    model = commands.add_parser("download-model", help="download the published model")
+    model.add_argument("directory", nargs="?", help="default: the user cache")
+    model.set_defaults(run=_download_model_command)
 
     args = parser.parse_args(argv)
     return args.run(args)
