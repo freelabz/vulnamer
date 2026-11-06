@@ -682,9 +682,6 @@ class TestKernelThroughThePipeline(unittest.TestCase):
         self.assertEqual(V.description_hash("a\n\nb "), V.description_hash("a b"))
 
 
-@unittest.skipUnless(
-    os.environ.get("VULNAMER_MODEL"), "set VULNAMER_MODEL to the exported model"
-)
 class TestVendorNames(unittest.TestCase):
     def test_keeps_vendor_titles(self):
         for title in (
@@ -763,6 +760,9 @@ class TestModelDownload(unittest.TestCase):
         self.assertIn(V.MODEL_VERSION, V.MODEL_URL)
 
 
+@unittest.skipUnless(
+    os.environ.get("VULNAMER_MODEL"), "set VULNAMER_MODEL to the exported model"
+)
 class TestRealModel(unittest.TestCase):
     """Runs the exported ONNX model. Needs the ``model`` extra."""
 
