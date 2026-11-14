@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import logging
@@ -241,7 +242,7 @@ _FLAW_PATTERNS: Tuple[Tuple[str, str], ...] = (
     (r"\blocal file inclusion|\blfi\b", "Local File Inclusion"),
     (r"\bremote file inclusion|\brfi\b", "Remote File Inclusion"),
     (
-        r"\bcommand injection|execute (?:arbitrary )?(?:os |shell |system )?commands",
+        r"\b(?:command|shell) injection|execute (?:arbitrary )?(?:os |shell |system )?commands",
         "Command Injection",
     ),
     (r"\bdeserializ", "Insecure Deserialization"),
@@ -806,9 +807,12 @@ def resolve_name(
         ("ghsa", ghsa_summary, ""),
         ("cna", cna_title, description),
     )
+    if not any(raw for _, raw, _ in curated):
+        log.debug("nuclei, kev, ghsa, cna: no titles given, the nightly dataset has them by CVE ID")
     for source, raw, context in curated:
         if not raw:
-            log.debug("%s: nothing given", source)
+            if any(raw for _, raw, _ in curated):
+                log.debug("%s: nothing given", source)
             continue
         name = clean_name(raw, context)
         if name:
@@ -1158,12 +1162,42 @@ def _build_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _model_installed() -> bool:
+    return all(importlib.util.find_spec(module) for module in ("onnxruntime", "tokenizers"))
+
+
+def _no_name_hint(
+    cve_id: str, description: str, found: Optional[VulnName], dataset_read: bool, model_used: bool
+) -> str:
+    """Say what the user can pass or install to get a name."""
+    hints = []
+    if cve_id and not dataset_read:
+        hints.append("The nightly dataset could not be read.")
+    elif cve_id and found is None:
+        hints.append(f"{cve_id} is not in the nightly dataset yet.")
+    elif cve_id:
+        hints.append(f"The nightly dataset has no name for {cve_id}.")
+    if not description:
+        hints.append("Add --description to name it from its description.")
+        return " ".join(hints)
+    if not cve_id:
+        hints.append("Pass a CVE ID to use the nightly dataset.")
+    if model_used:
+        hints.append("The description does not clearly name a product and a flaw.")
+    elif _model_installed():
+        hints.append("Add --model to run the model on the description.")
+    else:
+        hints.append('Install "vulnamer[model]" and add --model to run the model on the description.')
+    return " ".join(hints)
+
+
 def _name_command(args: argparse.Namespace) -> int:
     if args.cve and not _CVE_ID_RE.match(args.cve):
         raise SystemExit(f"vulnamer: {args.cve!r} is not a CVE ID, use --description for free text")
     if not args.cve and not args.description:
         raise SystemExit("vulnamer: give a CVE ID, a --description, or both")
     cve_id = (args.cve or "").upper()
+    found, dataset_read, namer = None, True, None
     if cve_id:
         try:
             found = lookup_name(cve_id, offline=args.offline)
@@ -1171,22 +1205,24 @@ def _name_command(args: argparse.Namespace) -> int:
             if not args.description:
                 raise SystemExit(f"vulnamer: cannot read the dataset: {error}")
             log.warning("dataset: unavailable (%s), naming the description instead", error)
-            found = None
-        if not args.description:
-            print(json.dumps((found or VulnName(None, None)).__dict__, ensure_ascii=False))
-            return 0
-        if found and found.name:
-            print(json.dumps(found.__dict__, ensure_ascii=False))
-            return 0
-        log.debug("dataset: no name for %s, naming the description instead", cve_id)
-    namer = None
-    if args.model is not None:
-        if args.model:
-            namer = ModelNamer(args.model, args.threads)
-        else:
-            namer = ModelNamer.load(args.threads, download=not args.offline)
-    resolved = resolve_name(args.description, cve_id, namer=namer)
-    print(json.dumps(resolved.__dict__, ensure_ascii=False))
+            dataset_read = False
+    if found and (found.name or not args.description):
+        result = found
+    elif args.description:
+        if cve_id:
+            log.debug("dataset: no name for %s, naming the description instead", cve_id)
+        if args.model is not None:
+            if args.model:
+                namer = ModelNamer(args.model, args.threads)
+            else:
+                namer = ModelNamer.load(args.threads, download=not args.offline)
+        result = resolve_name(args.description, cve_id, namer=namer)
+    else:
+        result = VulnName(None, None)
+    print(json.dumps(result.__dict__, ensure_ascii=False), flush=True)
+    if not result.name:
+        hint = _no_name_hint(cve_id, args.description or "", found, dataset_read, namer is not None)
+        print(f"vulnamer: no name found. {hint}", file=sys.stderr)
     return 0
 
 
