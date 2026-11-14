@@ -4,7 +4,7 @@ build-backend = 'hatchling.build'
 
 [project]
 name = 'vulnamer'
-version = '0.0.0'
+version = "0.1.0"
 authors = [{ name = 'FreeLabz', email = 'sales@freelabz.com' }]
 readme = 'README.md'
 description = 'Turn CVEs into short, human-readable vulnerability names.'
