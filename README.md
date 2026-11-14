@@ -132,6 +132,48 @@ logging.getLogger("vulnamer").setLevel(logging.DEBUG)
 
 `vulnamer download-model [DIR]` fetches the model ahead of time.
 
+### One source at a time
+
+`--source` skips the dataset and asks sources live, so you can see what each one gives.
+It takes `all` or a comma-separated list of `nuclei`, `kev`, `ghsa`, `cna`, `vendor`,
+`kernel`, `model` and `heuristic`:
+
+```console
+$ vulnamer name CVE-2021-44228 --source kev
+{"id": "CVE-2021-44228", "name": "Apache Log4j2 Remote Code Execution", "source": "kev", "public_name": "Log4Shell", "sources": {"kev": {"raw": "Apache Log4j2 Remote Code Execution Vulnerability", "name": "Apache Log4j2 Remote Code Execution"}}}
+```
+
+For each source, `raw` is its text, `name` is what survives the checks, and `note` says
+why there is no name. The top-level `name` and `source` come from the first named source
+in the usual order, so `--source all` reproduces the dataset's choice from today's data.
+
+Only the feeds the chosen sources need are downloaded:
+
+| Source | Live data |
+|---|---|
+| `nuclei` | nuclei-templates `cves.json` |
+| `kev` | the CISA KEV feed |
+| `ghsa` | the GitHub advisory API, reviewed advisories only. Set `GITHUB_TOKEN` to lift the limit of 60 calls an hour. |
+| `cna` | the CVE record from `cveawg.mitre.org` |
+| `vendor`, `kernel`, `heuristic`, `model` | the description from the CVE record, or `-d` |
+
+`model` needs the `model` extra. With `-d` and no CVE ID, only the description sources can
+answer. `public_name` comes from the reviewed table only. Names mined from PoC-in-GitHub are
+in the dataset.
+
+The same in Python:
+
+```python
+import vulnamer
+
+evidence, errors = vulnamer.fetch_evidence("CVE-2021-44228", ["kev"])  # errors: feeds that failed
+results = vulnamer.name_each_source(sources=["kev"], **evidence)
+print(results["kev"].name)  # Apache Log4j2 Remote Code Execution
+```
+
+`name_each_source` makes no network calls, so you can pass it titles from your own data.
+Pass `namer=vulnamer.ModelNamer.load()` to include the model.
+
 ## How a name is chosen
 
 Sources are tried in this order, and the first good name wins:

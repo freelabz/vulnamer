@@ -7,6 +7,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -932,6 +933,207 @@ class TestResolveLogging(unittest.TestCase):
         self.assertIn("model: rejected 'Apache Struts - Code Execution'", output)
         _, output = self.logs(description=LOG4J_DESC, namer=FakeNamer())
         self.assertIn("model: accepted 'Apache Log4j2 - Code Execution'", output)
+
+
+LOG4J_EVIDENCE = {
+    "nuclei_name": "Apache Log4j2 Remote Code Injection",
+    "kev_name": "Apache Log4j2 Remote Code Execution Vulnerability",
+    "ghsa_summary": "Remote code injection in Log4j",
+    "cna_title": "Apache Log4j2 JNDI features do not protect against attacker controlled LDAP",
+}
+
+
+class TestNameEachSource(unittest.TestCase):
+    def test_one_source(self):
+        results = V.name_each_source(LOG4J_DESC, sources=["kev"], **LOG4J_EVIDENCE)
+        self.assertEqual(list(results), ["kev"])
+        self.assertEqual(results["kev"].raw, "Apache Log4j2 Remote Code Execution Vulnerability")
+        self.assertEqual(results["kev"].name, "Apache Log4j2 Remote Code Execution")
+
+    def test_every_source_runs_and_keeps_the_order(self):
+        namer = FakeNamer()
+        results = V.name_each_source(LOG4J_DESC, namer=namer, **LOG4J_EVIDENCE)
+        self.assertEqual(list(results), list(V.SOURCES))
+        self.assertEqual(results["model"].name, "Apache Log4j2 - Code Execution")
+        self.assertEqual(namer.calls, [LOG4J_DESC])  # runs even though nuclei already named it
+        self.assertEqual(results["vendor"].note, "nothing found")
+
+    def test_explains_what_is_missing(self):
+        results = V.name_each_source(kev_name="Vulnerability", sources=["kev", "nuclei", "model"])
+        self.assertEqual(results["kev"].note, "rejected by the checks")
+        self.assertEqual(results["nuclei"].note, "no title")
+        self.assertEqual(results["model"].note, "no description")
+        self.assertEqual(V.name_each_source(LOG4J_DESC, sources=["model"])["model"].note, "model not loaded")
+
+    def test_unknown_source(self):
+        with self.assertRaises(ValueError):
+            V.name_each_source(LOG4J_DESC, sources=["nvd"])
+
+    def test_first_named_source_is_what_resolve_name_picks(self):
+        prefix = "In the Linux kernel, the following vulnerability has been resolved:\n\n"
+        cases = [
+            dict(description=LOG4J_DESC, **LOG4J_EVIDENCE),
+            dict(description=LOG4J_DESC, kev_name="Vulnerability", ghsa_summary="Remote code injection in Log4j"),
+            dict(description="Foo Server has a buffer overflow, aka 'Foo Server Remote Code Execution'."),
+            dict(description=prefix + "ovl: fix UAF in ovl_do_mkdir"),
+            dict(description="Shell injection in AcmeShop 2.1.", namer=FakeNamer("Nope - Wrong Product")),
+            dict(description="Shell injection on Command Error"),
+        ]
+        for case in cases:
+            expected = V.resolve_name(**case)
+            results = V.name_each_source(**case)
+            winner = next((source for source in V.SOURCES if results[source].name), None)
+            self.assertEqual((winner, winner and results[winner].name), (expected.source, expected.name))
+
+
+class FakeFeeds:
+    """Serves the live source URLs from memory and records what was requested."""
+
+    def __init__(self, kev=None, nuclei=None, advisories=None, record=None):
+        self.requested, self.headers = [], {}
+        self.responses = {
+            V.KEV_URL: json.dumps({"vulnerabilities": kev or []}),
+            V.NUCLEI_CVES_URL: "\n".join(json.dumps(item) for item in nuclei or []),
+            V.GHSA_API_URL.format(cve_id="CVE-2021-44228"): json.dumps(advisories or []),
+        }
+        if record:
+            self.responses[V.CVE_RECORD_URL.format(cve_id="CVE-2021-44228")] = json.dumps(record)
+
+    def __call__(self, url, headers=None):
+        self.requested.append(url)
+        self.headers[url] = headers or {}
+        if url not in self.responses:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        return self.responses[url].encode()
+
+
+def log4j_feeds():
+    return FakeFeeds(
+        kev=[{"cveID": "CVE-2021-44228", "vulnerabilityName": LOG4J_EVIDENCE["kev_name"]}],
+        nuclei=[{"ID": "CVE-2021-44228", "Info": {"Name": LOG4J_EVIDENCE["nuclei_name"]}}],
+        advisories=[{"summary": "Vulnerability"}, {"summary": LOG4J_EVIDENCE["ghsa_summary"]}],
+        record={
+            "cveMetadata": {"state": "PUBLISHED", "cveId": "CVE-2021-44228"},
+            "containers": {
+                "cna": {
+                    "title": LOG4J_EVIDENCE["cna_title"],
+                    "descriptions": [{"lang": "en", "value": LOG4J_DESC}],
+                }
+            },
+        },
+    )
+
+
+class TestFetchEvidence(unittest.TestCase):
+    def fetch(self, feeds, sources=V.SOURCES, env=None):
+        with mock.patch.object(V, "_http_get", feeds), mock.patch.dict(os.environ, env or {}, clear=True):
+            return V.fetch_evidence("cve-2021-44228", sources)
+
+    def test_fetches_every_source(self):
+        evidence, errors = self.fetch(log4j_feeds())
+        self.assertEqual(errors, {})
+        self.assertEqual(
+            evidence,
+            {"description": LOG4J_DESC, **LOG4J_EVIDENCE},  # the usable advisory summary wins
+        )
+
+    def test_downloads_only_what_the_sources_need(self):
+        feeds = log4j_feeds()
+        self.fetch(feeds, ["kev"])
+        self.assertEqual(feeds.requested, [V.KEV_URL])
+        feeds = log4j_feeds()
+        self.fetch(feeds, ["heuristic"])
+        self.assertEqual(feeds.requested, [V.CVE_RECORD_URL.format(cve_id="CVE-2021-44228")])
+
+    def test_asks_github_for_reviewed_advisories_with_a_token_if_set(self):
+        self.assertIn("type=reviewed", V.GHSA_API_URL)
+        feeds = log4j_feeds()
+        self.fetch(feeds, ["ghsa"], env={"GITHUB_TOKEN": "secret"})
+        url = V.GHSA_API_URL.format(cve_id="CVE-2021-44228")
+        self.assertEqual(feeds.headers[url], {"Authorization": "Bearer secret"})
+        feeds = log4j_feeds()
+        self.fetch(feeds, ["ghsa"])
+        self.assertEqual(feeds.headers[url], {})
+
+    def test_reports_what_could_not_be_fetched(self):
+        evidence, errors = self.fetch(FakeFeeds(), ["cna", "kev"])
+        self.assertEqual(errors, {"cve record": "not found"})
+        self.assertNotIn("description", evidence)
+        self.assertIsNone(evidence["kev_name"])
+
+
+class TestSourceOption(unittest.TestCase):
+    def run_cli(self, *argv, feeds=None, model_installed=False):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(V, "_http_get", feeds or log4j_feeds()), \
+                mock.patch.object(V, "_download", side_effect=AssertionError("dataset used")), \
+                mock.patch.object(V, "_model_installed", return_value=model_installed), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = V.main(["name", *argv])
+        return code, json.loads(out.getvalue()), err.getvalue()
+
+    def test_single_source(self):
+        code, result, _ = self.run_cli("CVE-2021-44228", "--source", "kev")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            result,
+            {
+                "id": "CVE-2021-44228",
+                "name": "Apache Log4j2 Remote Code Execution",
+                "source": "kev",
+                "public_name": "Log4Shell",
+                "sources": {
+                    "kev": {
+                        "raw": "Apache Log4j2 Remote Code Execution Vulnerability",
+                        "name": "Apache Log4j2 Remote Code Execution",
+                    }
+                },
+            },
+        )
+
+    def test_all_sources_pick_the_same_winner_as_the_naming_order(self):
+        _, result, _ = self.run_cli("CVE-2021-44228", "-s", "all")
+        self.assertEqual(list(result["sources"]), list(V.SOURCES))
+        self.assertEqual(result["source"], "nuclei")
+        self.assertEqual(result["sources"]["model"], {"note": 'install "vulnamer[model]" to run the model'})
+
+    def test_runs_the_model_when_installed(self):
+        fake = FakeNamer()
+        with mock.patch.object(V.ModelNamer, "load", return_value=fake):
+            _, result, _ = self.run_cli("CVE-2021-44228", "-s", "model", model_installed=True)
+        self.assertEqual(result["source"], "model")
+        self.assertEqual(fake.calls, [LOG4J_DESC])
+
+    def test_comma_separated_sources(self):
+        _, result, _ = self.run_cli("CVE-2021-44228", "-s", "heuristic, kev")
+        self.assertEqual(list(result["sources"]), ["kev", "heuristic"])  # always in naming order
+
+    def test_description_only(self):
+        _, result, _ = self.run_cli("-d", "Shell injection in AcmeShop 2.1.", "-s", "kev,heuristic")
+        self.assertEqual(result["sources"]["kev"], {"note": "needs a CVE ID"})
+        self.assertEqual(result["name"], "AcmeShop - Command Injection")
+
+    def test_unknown_cve_explains_each_source(self):
+        _, result, _ = self.run_cli("CVE-2021-44228", "-s", "all", feeds=FakeFeeds())
+        notes = {source: entry["note"] for source, entry in result["sources"].items()}
+        self.assertEqual(notes["kev"], "not in the CISA KEV catalog")
+        self.assertEqual(notes["ghsa"], "no GitHub-reviewed advisory")
+        self.assertEqual(notes["cna"], "could not fetch the cve record: not found")
+        self.assertEqual(notes["heuristic"], "no description, the cve record: not found")
+        self.assertIsNone(result["name"])
+
+    def test_verbose_reports_each_source(self):
+        _, _, err = self.run_cli("CVE-2021-44228", "-s", "kev,vendor", "-v")
+        self.assertIn("[vulnamer] kev: fetching", err)
+        self.assertIn("[vulnamer] kev: Apache Log4j2 Remote Code Execution", err)
+        self.assertIn("[vulnamer] vendor: nothing found", err)
+
+    def test_rejects_bad_input(self):
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            V.main(["name", "CVE-2021-44228", "-s", "nvd"])
+        with self.assertRaises(SystemExit) as raised:
+            V.main(["name", "CVE-2021-44228", "-s", "kev", "--offline"])
+        self.assertIn("cannot run with --offline", str(raised.exception))
 
 
 class TestModelDownload(unittest.TestCase):
