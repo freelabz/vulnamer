@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -25,6 +26,9 @@ class FakeNamer:
     def name(self, descriptions):
         self.calls.extend(descriptions)
         return [self.output for _ in descriptions]
+
+    def generate(self, descriptions):
+        return self.name(descriptions)
 
 
 class TestNormalize(unittest.TestCase):
@@ -705,6 +709,181 @@ class TestVendorNames(unittest.TestCase):
         description = "Foo Server has a buffer overflow, aka 'the second issue'."
         result = V.resolve_name(description, namer=FakeNamer("Foo Server - Buffer Overflow"))
         self.assertEqual(result.source, "model")
+
+
+DATASET_ROWS = [
+    {"id": "CVE-2026-109618", "name": "PHP Memory Corruption", "source": "kev", "public_name": "PHP2Shell"},
+    {"id": "CVE-2026-1000", "name": "Foo - Odd Flaw", "source": "model"},
+    {"id": "CVE-2026-10000", "name": None, "source": None, "public_name": "FooShell"},
+]
+
+
+class DatasetCache(unittest.TestCase):
+    """Points the cache at a temporary directory and serves a small dataset."""
+
+    def setUp(self):
+        work = tempfile.TemporaryDirectory()
+        self.addCleanup(work.cleanup)
+        patcher = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": work.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.source = os.path.join(work.name, "published.jsonl.gz")
+        with gzip.open(self.source, "wt", encoding="utf-8") as output:
+            for row in DATASET_ROWS:
+                output.write(json.dumps(row) + "\n")
+        self.downloads = 0
+        self.fail_download = False
+        patcher = mock.patch.object(V, "_download", self.fake_download)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fake_download(self, url, directory):
+        self.assertEqual(url, V.DATASET_URL)
+        self.downloads += 1
+        if self.fail_download:
+            raise OSError("network is unreachable")
+        path = os.path.join(directory, "download")
+        shutil.copyfile(self.source, path)
+        return path
+
+    def age_cache(self, seconds):
+        path = os.path.join(V.cache_dir(), "vuln_names.jsonl.gz")
+        old = os.path.getmtime(path) - seconds
+        os.utime(path, (old, old))
+
+
+class TestLookup(DatasetCache):
+    def test_downloads_once_then_reads_the_cache(self):
+        found = V.lookup_name("CVE-2026-109618")
+        self.assertEqual(found, V.VulnName("PHP Memory Corruption", "kev", "PHP2Shell"))
+        self.assertEqual(V.lookup_name("cve-2026-1000").source, "model")
+        self.assertEqual(self.downloads, 1)
+
+    def test_unlisted_cve(self):
+        self.assertIsNone(V.lookup_name("CVE-2099-0001"))
+
+    def test_id_prefix_does_not_match_a_longer_id(self):
+        self.assertEqual(V.lookup_name("CVE-2026-1000").name, "Foo - Odd Flaw")
+        self.assertEqual(V.lookup_name("CVE-2026-10000").public_name, "FooShell")
+
+    def test_stale_cache_is_refreshed(self):
+        V.lookup_name("CVE-2026-1000")
+        self.age_cache(V.DATASET_MAX_AGE + 60)
+        V.lookup_name("CVE-2026-1000")
+        self.assertEqual(self.downloads, 2)
+
+    def test_failed_refresh_keeps_the_stale_copy(self):
+        V.lookup_name("CVE-2026-1000")
+        self.age_cache(V.DATASET_MAX_AGE + 60)
+        self.fail_download = True
+        with self.assertLogs("vulnamer", "WARNING"):
+            self.assertEqual(V.lookup_name("CVE-2026-1000").name, "Foo - Odd Flaw")
+
+    def test_failed_first_download_raises(self):
+        self.fail_download = True
+        with self.assertRaises(OSError):
+            V.lookup_name("CVE-2026-1000")
+
+    def test_offline_uses_a_stale_copy_without_downloading(self):
+        V.lookup_name("CVE-2026-1000")
+        self.age_cache(V.DATASET_MAX_AGE * 30)
+        self.assertEqual(V.lookup_name("CVE-2026-1000", offline=True).name, "Foo - Odd Flaw")
+        self.assertEqual(self.downloads, 1)
+
+    def test_offline_without_a_copy_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            V.lookup_name("CVE-2026-1000", offline=True)
+        self.assertEqual(self.downloads, 0)
+
+
+class TestNameCommand(DatasetCache):
+    def run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = V.main(["name", *argv])
+        return code, json.loads(out.getvalue()), err.getvalue()
+
+    def test_looks_up_a_cve(self):
+        code, result, err = self.run_cli("CVE-2026-109618")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            result, {"name": "PHP Memory Corruption", "source": "kev", "public_name": "PHP2Shell"}
+        )
+        self.assertEqual(err, "")
+
+    def test_dataset_name_wins_over_the_description(self):
+        _, result, _ = self.run_cli("CVE-2026-1000", "-d", "SQL injection in AcmeShop 2.1 login.")
+        self.assertEqual(result["source"], "model")
+        self.assertEqual(result["name"], "Foo - Odd Flaw")
+
+    def test_unlisted_cve_names_the_description(self):
+        _, result, _ = self.run_cli("CVE-2099-0001", "-d", "SQL injection in AcmeShop 2.1 login.")
+        self.assertEqual(result["source"], "heuristic")
+
+    def test_unnamed_listed_cve_keeps_its_public_name(self):
+        _, result, _ = self.run_cli("CVE-2026-10000", "-d", "SQL injection in AcmeShop 2.1 login.")
+        self.assertEqual(result["source"], "heuristic")
+        _, result, _ = self.run_cli("CVE-2026-10000")
+        self.assertEqual(result, {"name": None, "source": None, "public_name": "FooShell"})
+
+    def test_description_alone(self):
+        _, result, _ = self.run_cli("--description", "SQL injection in AcmeShop 2.1 login.")
+        self.assertEqual(result["source"], "heuristic")
+        self.assertEqual(self.downloads, 0)
+
+    def test_offline_without_a_dataset_falls_back_to_the_description(self):
+        _, result, err = self.run_cli(
+            "CVE-2026-1000", "--offline", "-v", "-d", "SQL injection in AcmeShop 2.1 login."
+        )
+        self.assertEqual(result["source"], "heuristic")
+        self.assertIn("unavailable", err)
+
+    def test_verbose_shows_each_step_on_stderr(self):
+        _, _, err = self.run_cli("CVE-2099-0001", "-v", "-d", "SQL injection in AcmeShop 2.1 login.")
+        for step in ("dataset: downloading", "is not listed", "nuclei: nothing given", "heuristic: accepted"):
+            self.assertIn(step, err)
+        self.assertTrue(all(line.startswith("[vulnamer] ") for line in err.splitlines()))
+        self.assertEqual(V.log.handlers, [])
+
+    def test_rejects_bad_input(self):
+        for argv, message in (
+            (["SQL injection in AcmeShop"], "is not a CVE ID"),
+            ([], "give a CVE ID"),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                V.main(["name", *argv])
+            self.assertIn(message, str(raised.exception))
+
+    def test_offline_without_a_dataset_or_description_fails(self):
+        with self.assertRaises(SystemExit) as raised:
+            V.main(["name", "CVE-2026-1000", "--offline"])
+        self.assertIn("cannot read the dataset", str(raised.exception))
+
+
+class TestResolveLogging(unittest.TestCase):
+    def logs(self, **kwargs):
+        with self.assertLogs("vulnamer", "DEBUG") as captured:
+            result = V.resolve_name(**kwargs)
+        return result, "\n".join(captured.output)
+
+    def test_reports_rejected_and_accepted_sources(self):
+        result, output = self.logs(
+            description=LOG4J_DESC,
+            cve_id="CVE-2021-44228",
+            nuclei_name="Vulnerability",
+            kev_name="Apache Log4j2 Remote Code Execution Vulnerability",
+        )
+        self.assertEqual(result.source, "kev")
+        self.assertIn("public name: 'Log4Shell' from the reviewed table", output)
+        self.assertIn("nuclei: rejected 'Vulnerability'", output)
+        self.assertIn("kev: accepted 'Apache Log4j2 Remote Code Execution'", output)
+        self.assertNotIn("ghsa", output)  # stops at the first good name
+
+    def test_reports_the_raw_model_output(self):
+        _, output = self.logs(description=LOG4J_DESC, namer=FakeNamer("Apache Struts - Code Execution"))
+        self.assertIn("model: rejected 'Apache Struts - Code Execution'", output)
+        _, output = self.logs(description=LOG4J_DESC, namer=FakeNamer())
+        self.assertIn("model: accepted 'Apache Log4j2 - Code Execution'", output)
 
 
 class TestModelDownload(unittest.TestCase):
