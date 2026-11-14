@@ -879,7 +879,12 @@ class TestNameCommand(DatasetCache):
             _, result, err = self.run_cli("-d", "Shell injection on Command Error", "--model", "dir")
         self.assertEqual(fake.calls, ["Shell injection on Command Error"])
         self.assertIsNone(result["name"])
-        self.assertIn("does not clearly name a product and a flaw", err)
+        self.assertIn(
+            "The model's name 'Command Error in Command Error' was rejected because it does not match"
+            " the description.",
+            err,
+        )
+        self.assertIn("may not clearly name a product and a flaw", err)
         self.assertNotIn("--model", err)
 
     def test_hint_for_a_cve_the_dataset_cannot_name(self):

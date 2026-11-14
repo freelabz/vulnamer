@@ -1283,8 +1283,25 @@ def _model_installed() -> bool:
     return all(importlib.util.find_spec(module) for module in ("onnxruntime", "tokenizers"))
 
 
+class _RecordingNamer:
+    """Wraps a namer to keep its last raw output, so a rejected name can be quoted."""
+
+    def __init__(self, namer):
+        self.namer, self.last_output = namer, None
+
+    def generate(self, descriptions):
+        outputs = self.namer.generate(descriptions)
+        self.last_output = outputs[-1] if outputs else None
+        return outputs
+
+
 def _no_name_hint(
-    cve_id: str, description: str, found: Optional[VulnName], dataset_read: bool, model_used: bool
+    cve_id: str,
+    description: str,
+    found: Optional[VulnName],
+    dataset_read: bool,
+    model_used: bool,
+    model_output: Optional[str] = None,
 ) -> str:
     """Say what the user can pass or install to get a name."""
     hints = []
@@ -1299,7 +1316,12 @@ def _no_name_hint(
         return " ".join(hints)
     if not cve_id:
         hints.append("Pass a CVE ID to use the nightly dataset.")
-    if model_used:
+    if model_used and model_output:
+        hints.append(
+            f"The model's name {model_output!r} was rejected because it does not match the description."
+            " The description may not clearly name a product and a flaw."
+        )
+    elif model_used:
         hints.append("The description does not clearly name a product and a flaw.")
     elif _model_installed():
         hints.append("Add --model to run the model on the description.")
@@ -1416,13 +1438,16 @@ def _name_command(args: argparse.Namespace) -> int:
         if cve_id:
             log.debug("dataset: no name for %s, naming the description instead", cve_id)
         if args.model is not None:
-            namer = _load_namer(args.model, args.threads, args.offline)
+            namer = _RecordingNamer(_load_namer(args.model, args.threads, args.offline))
         result = resolve_name(args.description, cve_id, namer=namer)
     else:
         result = VulnName(None, None)
     print(json.dumps(result.__dict__, ensure_ascii=False), flush=True)
     if not result.name:
-        hint = _no_name_hint(cve_id, args.description or "", found, dataset_read, namer is not None)
+        model_output = namer.last_output if namer else None
+        hint = _no_name_hint(
+            cve_id, args.description or "", found, dataset_read, namer is not None, model_output
+        )
         print(f"vulnamer: no name found. {hint}", file=sys.stderr)
     return 0
 
