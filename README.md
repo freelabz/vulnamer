@@ -102,10 +102,7 @@ $ vulnamer name CVE-2099-0001 -d "SQL injection in the login form of AcmeShop 2.
 [vulnamer] dataset: using cached ~/.cache/vulnamer/vuln_names.jsonl.gz (2.3 hours old)
 [vulnamer] dataset: CVE-2099-0001 is not listed
 [vulnamer] dataset: no name for CVE-2099-0001, naming the description instead
-[vulnamer] nuclei: nothing given
-[vulnamer] kev: nothing given
-[vulnamer] ghsa: nothing given
-[vulnamer] cna: nothing given
+[vulnamer] nuclei, kev, ghsa, cna: no titles given, the nightly dataset has them by CVE ID
 [vulnamer] vendor: no usable 'aka' title in the description
 [vulnamer] kernel: not a usable Linux kernel commit message
 [vulnamer] model: not used, no model loaded
@@ -114,6 +111,15 @@ $ vulnamer name CVE-2099-0001 -d "SQL injection in the login form of AcmeShop 2.
 
 When the dataset has the CVE, the log says which source named it. The other sources were
 checked when the dataset was built.
+
+When nothing can be named, the JSON still prints with `null` fields, and a line on stderr
+says what would help:
+
+```console
+$ vulnamer name -d "Shell injection on Command Error"
+{"name": null, "source": null, "public_name": null}
+vulnamer: no name found. Pass a CVE ID to use the nightly dataset. Install "vulnamer[model]" and add --model to run the model on the description.
+```
 
 In Python, the same messages go to the `vulnamer` logger at `DEBUG` level:
 

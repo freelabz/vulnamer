@@ -61,6 +61,15 @@ class TestNormalize(unittest.TestCase):
         )
 
 
+class TestShellInjection(unittest.TestCase):
+    def test_shell_injection_is_a_command_injection(self):
+        self.assertEqual(
+            V.heuristic_name("Shell injection in AcmeShop 2.1 allows running commands."),
+            "AcmeShop - Command Injection",
+        )
+        self.assertIsNone(V.heuristic_name("Shell injection on Command Error"))
+
+
 class TestQualityGate(unittest.TestCase):
     def test_accepts_real_names(self):
         for name in (
@@ -840,10 +849,44 @@ class TestNameCommand(DatasetCache):
 
     def test_verbose_shows_each_step_on_stderr(self):
         _, _, err = self.run_cli("CVE-2099-0001", "-v", "-d", "SQL injection in AcmeShop 2.1 login.")
-        for step in ("dataset: downloading", "is not listed", "nuclei: nothing given", "heuristic: accepted"):
+        for step in ("dataset: downloading", "is not listed", "nuclei, kev, ghsa, cna: no titles", "heuristic: accepted"):
             self.assertIn(step, err)
         self.assertTrue(all(line.startswith("[vulnamer] ") for line in err.splitlines()))
+        self.assertNotIn("nuclei: nothing given", err)
         self.assertEqual(V.log.handlers, [])
+
+    def test_no_hint_when_a_name_is_found(self):
+        _, result, err = self.run_cli("-d", "Shell injection in AcmeShop 2.1.")
+        self.assertEqual(result["name"], "AcmeShop - Command Injection")
+        self.assertEqual(err, "")
+
+    def test_hint_for_free_text_without_the_model(self):
+        with mock.patch.object(V, "_model_installed", return_value=False):
+            _, result, err = self.run_cli("-d", "Shell injection on Command Error")
+        self.assertIsNone(result["name"])
+        self.assertIn("vulnamer: no name found.", err)
+        self.assertIn("Pass a CVE ID to use the nightly dataset.", err)
+        self.assertIn('Install "vulnamer[model]" and add --model', err)
+        with mock.patch.object(V, "_model_installed", return_value=True):
+            _, _, err = self.run_cli("-d", "Shell injection on Command Error")
+        self.assertIn("Add --model to run the model", err)
+        self.assertNotIn("Install", err)
+
+    def test_hint_when_the_model_could_not_name_it(self):
+        fake = FakeNamer("Command Error in Command Error")
+        with mock.patch.object(V, "ModelNamer", lambda *args: fake):
+            _, result, err = self.run_cli("-d", "Shell injection on Command Error", "--model", "dir")
+        self.assertEqual(fake.calls, ["Shell injection on Command Error"])
+        self.assertIsNone(result["name"])
+        self.assertIn("does not clearly name a product and a flaw", err)
+        self.assertNotIn("--model", err)
+
+    def test_hint_for_a_cve_the_dataset_cannot_name(self):
+        _, _, err = self.run_cli("CVE-2099-0001")
+        self.assertIn("CVE-2099-0001 is not in the nightly dataset yet.", err)
+        self.assertIn("Add --description", err)
+        _, _, err = self.run_cli("CVE-2026-10000")
+        self.assertIn("The nightly dataset has no name for CVE-2026-10000.", err)
 
     def test_rejects_bad_input(self):
         for argv, message in (
@@ -878,6 +921,11 @@ class TestResolveLogging(unittest.TestCase):
         self.assertIn("nuclei: rejected 'Vulnerability'", output)
         self.assertIn("kev: accepted 'Apache Log4j2 Remote Code Execution'", output)
         self.assertNotIn("ghsa", output)  # stops at the first good name
+
+    def test_one_line_when_no_titles_were_given(self):
+        _, output = self.logs(description="Shell injection on Command Error")
+        self.assertIn("nuclei, kev, ghsa, cna: no titles given", output)
+        self.assertNotIn("nothing given", output)
 
     def test_reports_the_raw_model_output(self):
         _, output = self.logs(description=LOG4J_DESC, namer=FakeNamer("Apache Struts - Code Execution"))
