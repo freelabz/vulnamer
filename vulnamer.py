@@ -54,6 +54,8 @@ NUCLEI_CVES_URL = (
 )
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 CVELIST_RELEASE_API = "https://api.github.com/repos/CVEProject/cvelistV5/releases/latest"
+CVE_RECORD_URL = "https://cveawg.mitre.org/api/cve/{cve_id}"
+GHSA_API_URL = "https://api.github.com/advisories?type=reviewed&cve_id={cve_id}"  # as in the nightly build
 GHSA_TARBALL_URL = "https://codeload.github.com/github/advisory-database/tar.gz/refs/heads/main"
 POC_TARBALL_URL = "https://codeload.github.com/nomi-sec/PoC-in-GitHub/tar.gz/refs/heads/master"
 HTTP_TIMEOUT = 120
@@ -713,6 +715,9 @@ class ModelNamer:
     EOS_ID = 1
 
     def __init__(self, model_dir: str, threads: Optional[int] = None):
+        missing = [name for name in MODEL_FILES if not os.path.isfile(os.path.join(model_dir, name))]
+        if missing:
+            raise FileNotFoundError(f"no vulnamer model in {model_dir}, missing {', '.join(missing)}")
         import numpy
         import onnxruntime
         from tokenizers import Tokenizer
@@ -736,7 +741,7 @@ class ModelNamer:
         """Load the published model from the cache, downloading it if it is missing.
 
         With ``download=False`` nothing touches the network, and a missing model
-        raises an error from ``onnxruntime``.
+        raises ``FileNotFoundError``.
         """
         return cls(download_model() if download else default_model_dir(), threads)
 
@@ -853,8 +858,120 @@ def resolve_name(
     return VulnName(None, None, public_name)
 
 
-def _http_get(url: str) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": f"vulnamer/{__version__}"})
+SOURCES = ("nuclei", "kev", "ghsa", "cna", "vendor", "kernel", "model", "heuristic")
+_NEEDS_CVE_ID = ("nuclei", "kev", "ghsa", "cna")
+
+
+@dataclass
+class SourceResult:
+    """What one source says: its raw text, the name kept from it, and why if none."""
+
+    raw: Optional[str] = None
+    name: Optional[str] = None
+    note: str = ""
+
+
+def name_each_source(
+    description: str = "",
+    nuclei_name: Optional[str] = None,
+    kev_name: Optional[str] = None,
+    ghsa_summary: Optional[str] = None,
+    cna_title: Optional[str] = None,
+    namer: Optional[ModelNamer] = None,
+    sources: Sequence[str] = SOURCES,
+) -> Dict[str, SourceResult]:
+    """Run each requested source on its own, with the same checks as ``resolve_name``.
+
+    Unlike ``resolve_name``, nothing stops at the first good name, so you can see what
+    every source would give. The first source in ``SOURCES`` order with a name is the
+    one ``resolve_name`` would pick from the same evidence.
+    """
+    unknown = set(sources) - set(SOURCES)
+    if unknown:
+        raise ValueError(f"unknown sources: {', '.join(sorted(unknown))}")
+    titles = {"nuclei": nuclei_name, "kev": kev_name, "ghsa": ghsa_summary, "cna": cna_title}
+    results: Dict[str, SourceResult] = {}
+    for source in (source for source in SOURCES if source in sources):
+        if source in titles:
+            raw = titles[source]
+            if not raw:
+                results[source] = SourceResult(note="no title")
+                continue
+            name = clean_name(raw, description if source == "cna" else "")
+            results[source] = SourceResult(raw, name, "" if name else "rejected by the checks")
+        elif not description:
+            results[source] = SourceResult(note="no description")
+        elif source == "model":
+            if namer is None:
+                results[source] = SourceResult(note="model not loaded")
+                continue
+            raw = namer.generate([description])[0]
+            name = check_generated_name(raw, description)
+            note = "" if name else "rejected, it does not match the description"
+            results[source] = SourceResult(raw, name, note)
+        else:
+            derive = {"vendor": vendor_name, "kernel": linux_kernel_name, "heuristic": heuristic_name}
+            name = derive[source](description)
+            results[source] = SourceResult(name=name, note="" if name else "nothing found")
+    return results
+
+
+def fetch_evidence(
+    cve_id: str, sources: Sequence[str] = SOURCES
+) -> Tuple[Dict[str, Optional[str]], Dict[str, str]]:
+    """Fetch what the live sources say about one CVE.
+
+    Returns ``(evidence, errors)``. ``evidence`` holds ``name_each_source`` arguments, and
+    ``errors`` maps each feed that could not be fetched to the reason. Only the feeds that
+    ``sources`` need are downloaded: the CVE record (description and CNA title), the CISA
+    KEV feed, nuclei's ``cves.json`` and the GitHub advisory API.
+    """
+    cve_id = cve_id.strip().upper()
+    evidence: Dict[str, Optional[str]] = {}
+    errors: Dict[str, str] = {}
+
+    def attempt(label: str, fetch):
+        log.debug("%s: fetching", label)
+        try:
+            return fetch()
+        except (OSError, ValueError, KeyError) as error:
+            reason = "not found" if getattr(error, "code", None) == 404 else str(error)
+            log.debug("%s: could not fetch (%s)", label, reason)
+            errors[label] = reason
+            return None
+
+    if set(sources) - {"nuclei", "kev", "ghsa"}:  # cna, or anything that reads the description
+        record = attempt("cve record", lambda: json.loads(_http_get(CVE_RECORD_URL.format(cve_id=cve_id))))
+        parsed = parse_cve_record(record) if record else None
+        if record and not parsed:
+            errors["cve record"] = "the CVE is not published"
+        if parsed:
+            evidence["description"], evidence["cna_title"] = parsed[1], parsed[2] or None
+    if "kev" in sources:
+        feed = attempt("kev", lambda: parse_kev(_http_get(KEV_URL).decode()))
+        if feed is not None:
+            evidence["kev_name"] = feed.get(cve_id)
+    if "nuclei" in sources:
+        feed = attempt("nuclei", lambda: parse_nuclei(_http_get(NUCLEI_CVES_URL).decode()))
+        if feed is not None:
+            evidence["nuclei_name"] = feed.get(cve_id)
+    if "ghsa" in sources:
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        advisories = attempt(
+            "ghsa", lambda: json.loads(_http_get(GHSA_API_URL.format(cve_id=cve_id), headers))
+        )
+        if advisories is not None:
+            summaries = [item.get("summary") for item in advisories if item.get("summary")]
+            usable = [summary for summary in summaries if clean_name(summary)]
+            evidence["ghsa_summary"] = (usable or summaries or [None])[0]
+    return evidence, errors
+
+
+def _http_get(url: str, headers: Optional[Dict[str, str]] = None) -> bytes:
+    request = urllib.request.Request(
+        url, headers={"User-Agent": f"vulnamer/{__version__}", **(headers or {})}
+    )
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:  # nosec B310
         return response.read()
 
@@ -1140,7 +1257,7 @@ def _build_command(args: argparse.Namespace) -> int:
         public_names = mine_public_names(references, descriptions)
         del descriptions
 
-        namer = ModelNamer(args.model, args.threads) if args.model else None
+        namer = _load_namer(args.model, args.threads, False) if args.model else None
         previous = read_dataset(args.previous) if args.previous else None
         counts: Counter = Counter()
         names = gzip.open(args.names, "wt", encoding="utf-8") if args.names else None
@@ -1166,8 +1283,25 @@ def _model_installed() -> bool:
     return all(importlib.util.find_spec(module) for module in ("onnxruntime", "tokenizers"))
 
 
+class _RecordingNamer:
+    """Wraps a namer to keep its last raw output, so a rejected name can be quoted."""
+
+    def __init__(self, namer):
+        self.namer, self.last_output = namer, None
+
+    def generate(self, descriptions):
+        outputs = self.namer.generate(descriptions)
+        self.last_output = outputs[-1] if outputs else None
+        return outputs
+
+
 def _no_name_hint(
-    cve_id: str, description: str, found: Optional[VulnName], dataset_read: bool, model_used: bool
+    cve_id: str,
+    description: str,
+    found: Optional[VulnName],
+    dataset_read: bool,
+    model_used: bool,
+    model_output: Optional[str] = None,
 ) -> str:
     """Say what the user can pass or install to get a name."""
     hints = []
@@ -1182,7 +1316,12 @@ def _no_name_hint(
         return " ".join(hints)
     if not cve_id:
         hints.append("Pass a CVE ID to use the nightly dataset.")
-    if model_used:
+    if model_used and model_output:
+        hints.append(
+            f"The model's name {model_output!r} was rejected because it does not match the description."
+            " The description may not clearly name a product and a flaw."
+        )
+    elif model_used:
         hints.append("The description does not clearly name a product and a flaw.")
     elif _model_installed():
         hints.append("Add --model to run the model on the description.")
@@ -1191,12 +1330,99 @@ def _no_name_hint(
     return " ".join(hints)
 
 
+def _load_namer(model_dir: str, threads: Optional[int], offline: bool) -> ModelNamer:
+    """Load the model for the CLI, turning setup problems into a message."""
+    try:
+        if model_dir:
+            return ModelNamer(model_dir, threads)
+        return ModelNamer.load(threads, download=not offline)
+    except ImportError:
+        raise SystemExit('vulnamer: the model needs the model extra: pip install "vulnamer[model]"')
+    except FileNotFoundError as error:
+        if model_dir:
+            raise SystemExit(
+                f"vulnamer: {error}. Use --model on its own for the published model,"
+                f" or run 'vulnamer download-model {model_dir}' to put it there."
+            )
+        raise SystemExit(f"vulnamer: {error}. Run once without --offline to download it.")
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"vulnamer: could not download the model: {error}")
+
+
+def _parse_sources(value: str) -> List[str]:
+    names = [part.strip().lower() for part in value.split(",") if part.strip()]
+    if names == ["all"]:
+        return list(SOURCES)
+    unknown = [name for name in names if name not in SOURCES]
+    if unknown or not names:
+        raise argparse.ArgumentTypeError(
+            f"unknown source {', '.join(unknown) or value!r}, choose from all, {', '.join(SOURCES)}"
+        )
+    return names
+
+
+def _source_command(args: argparse.Namespace, cve_id: str) -> int:
+    sources = args.source
+    needs_network = cve_id and (set(sources) & set(_NEEDS_CVE_ID) or not args.description)
+    if args.offline and needs_network:
+        raise SystemExit("vulnamer: --source fetches live data, so it cannot run with --offline")
+    evidence: Dict[str, Optional[str]] = {}
+    errors: Dict[str, str] = {}
+    if cve_id:
+        evidence, errors = fetch_evidence(cve_id, sources)
+    description = args.description or evidence.pop("description", None) or ""
+    evidence.pop("description", None)
+
+    namer = None
+    if "model" in sources and description and (args.model or _model_installed()):
+        namer = _load_namer(args.model, args.threads, args.offline)
+    results = name_each_source(description, namer=namer, sources=sources, **evidence)
+
+    feed_of = {"nuclei": "nuclei", "kev": "kev", "ghsa": "ghsa", "cna": "cve record"}
+    missing = {
+        "nuclei": "not in nuclei-templates",
+        "kev": "not in the CISA KEV catalog",
+        "ghsa": "no GitHub-reviewed advisory",
+        "cna": "the CVE record has no title",
+    }
+    for source, result in results.items():
+        feed = feed_of.get(source)
+        if source in _NEEDS_CVE_ID and not cve_id:
+            result.note = "needs a CVE ID"
+        elif feed in errors:
+            result.note = f"could not fetch the {feed}: {errors[feed]}"
+        elif result.note == "no title":
+            result.note = missing[source]
+        elif result.note == "no description" and "cve record" in errors:
+            result.note = f"no description, the cve record: {errors['cve record']}"
+        elif source == "model" and description and namer is None:
+            result.note = 'install "vulnamer[model]" to run the model'
+        log.debug("%s: %s", source, result.name or result.note or "no name")
+
+    winner = next((source for source in SOURCES if source in results and results[source].name), None)
+    output = {
+        "id": cve_id or None,
+        "name": results[winner].name if winner else None,
+        "source": winner,
+        "public_name": PUBLIC_NAMES.get(cve_id),
+        "sources": {
+            source: {key: value for key, value in result.__dict__.items() if value}
+            for source, result in results.items()
+        },
+    }
+    indent = 2 if sys.stdout.isatty() else None
+    print(json.dumps(output, ensure_ascii=False, indent=indent), flush=True)
+    return 0
+
+
 def _name_command(args: argparse.Namespace) -> int:
     if args.cve and not _CVE_ID_RE.match(args.cve):
         raise SystemExit(f"vulnamer: {args.cve!r} is not a CVE ID, use --description for free text")
     if not args.cve and not args.description:
         raise SystemExit("vulnamer: give a CVE ID, a --description, or both")
     cve_id = (args.cve or "").upper()
+    if args.source:
+        return _source_command(args, cve_id)
     found, dataset_read, namer = None, True, None
     if cve_id:
         try:
@@ -1212,16 +1438,16 @@ def _name_command(args: argparse.Namespace) -> int:
         if cve_id:
             log.debug("dataset: no name for %s, naming the description instead", cve_id)
         if args.model is not None:
-            if args.model:
-                namer = ModelNamer(args.model, args.threads)
-            else:
-                namer = ModelNamer.load(args.threads, download=not args.offline)
+            namer = _RecordingNamer(_load_namer(args.model, args.threads, args.offline))
         result = resolve_name(args.description, cve_id, namer=namer)
     else:
         result = VulnName(None, None)
     print(json.dumps(result.__dict__, ensure_ascii=False), flush=True)
     if not result.name:
-        hint = _no_name_hint(cve_id, args.description or "", found, dataset_read, namer is not None)
+        model_output = namer.last_output if namer else None
+        hint = _no_name_hint(
+            cve_id, args.description or "", found, dataset_read, namer is not None, model_output
+        )
         print(f"vulnamer: no name found. {hint}", file=sys.stderr)
     return 0
 
@@ -1250,6 +1476,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         nargs="?",
         const="",
         help="run the model on the description: a model directory, or nothing for the published model",
+    )
+    name.add_argument(
+        "-s",
+        "--source",
+        type=_parse_sources,
+        help="skip the dataset and ask these sources live, comma-separated: all, " + ", ".join(SOURCES),
     )
     name.add_argument("--offline", action="store_true", help="use only cached files")
     name.add_argument("--threads", type=int)
