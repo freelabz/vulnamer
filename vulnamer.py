@@ -21,12 +21,14 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 import zipfile
 from collections import Counter, defaultdict
@@ -58,6 +60,9 @@ HTTP_TIMEOUT = 120
 MIN_NAME_LENGTH = 12
 MAX_NAME_LENGTH = 110
 MIN_VENDOR_NAME_WORDS = 3
+DATASET_MAX_AGE = 24 * 3600  # seconds before a cached dataset is downloaded again
+
+log = logging.getLogger("vulnamer")
 
 # Words describing the flaw rather than the affected product.
 VULN_WORDS = frozenset("""
@@ -81,6 +86,7 @@ VULN_WORDS = frozenset("""
 
 _WS_RE = re.compile(r"\s+")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*")
+_CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.I)
 _CVE_RE = re.compile(r"\(?\bCVE-\d{4}-\d{4,}\b(?:\s*[/,&]\s*CVE-\d{4}-\d{4,})*\)?", re.I)
 _CWE_SUFFIX_RE = re.compile(r"\s*\(CWE-\d+\)\s*$", re.I)
 _TRAILING_VULN_RE = re.compile(r"[\s:,-]*\bvulnerabilit(?:y|ies)\b[\s.]*$", re.I)
@@ -788,27 +794,58 @@ def resolve_name(
     Every argument is optional. Pass ``generated_name`` for model output that was
     already produced in a batch, or ``namer`` to run the model here.
     """
-    public_name = PUBLIC_NAMES.get(cve_id) or public_name
-    candidates = (
-        ("nuclei", clean_name(nuclei_name)),
-        ("kev", clean_name(kev_name)),
-        ("ghsa", clean_name(ghsa_summary)),
-        ("cna", clean_name(cna_title, description)),
-        ("vendor", vendor_name(description)),
-        ("kernel", linux_kernel_name(description)),
+    if PUBLIC_NAMES.get(cve_id):
+        public_name = PUBLIC_NAMES[cve_id]
+        log.debug("public name: %r from the reviewed table", public_name)
+    elif public_name:
+        log.debug("public name: %r as given", public_name)
+
+    curated = (
+        ("nuclei", nuclei_name, ""),
+        ("kev", kev_name, ""),
+        ("ghsa", ghsa_summary, ""),
+        ("cna", cna_title, description),
     )
-    for source, name in candidates:
+    for source, raw, context in curated:
+        if not raw:
+            log.debug("%s: nothing given", source)
+            continue
+        name = clean_name(raw, context)
         if name:
+            log.debug("%s: accepted %r", source, name)
             return VulnName(name, source, public_name)
+        log.debug("%s: rejected %r", source, raw)
+
+    derived = (
+        ("vendor", vendor_name, "no usable 'aka' title in the description"),
+        ("kernel", linux_kernel_name, "not a usable Linux kernel commit message"),
+    )
+    for source, derive, missing in derived:
+        name = derive(description)
+        if name:
+            log.debug("%s: accepted %r", source, name)
+            return VulnName(name, source, public_name)
+        log.debug("%s: %s", source, missing)
 
     if generated_name is None and namer is not None and description:
-        generated_name = namer.name([description])[0]
+        raw = namer.generate([description])[0]
+        generated_name = check_generated_name(raw, description)
+        if generated_name:
+            log.debug("model: accepted %r (raw output %r)", generated_name, raw)
+        else:
+            log.debug("model: rejected %r, it does not match the description", raw)
+    elif generated_name:
+        log.debug("model: accepted %r (given)", generated_name)
+    elif generated_name is None:
+        log.debug("model: not used, %s", "no description" if namer else "no model loaded")
     if generated_name:
         return VulnName(generated_name, "model", public_name)
 
     heuristic = heuristic_name(description)
     if heuristic:
+        log.debug("heuristic: accepted %r", heuristic)
         return VulnName(heuristic, "heuristic", public_name)
+    log.debug("heuristic: no product and flaw found in the description")
     return VulnName(None, None, public_name)
 
 
@@ -913,10 +950,66 @@ def iter_poc_references(path: str) -> Iterator[Tuple[str, str]]:
                     yield base[: -len(".json")], url
 
 
+def cache_dir() -> str:
+    """Return vulnamer's cache directory, which follows ``XDG_CACHE_HOME``."""
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(cache, "vulnamer")
+
+
 def default_model_dir() -> str:
     """Return where the published model is cached."""
-    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(cache, "vulnamer", MODEL_VERSION)
+    return os.path.join(cache_dir(), MODEL_VERSION)
+
+
+def fetch_dataset(offline: bool = False, max_age: float = DATASET_MAX_AGE) -> str:
+    """Return the path of a cached copy of the nightly dataset, downloading it if needed.
+
+    The cache is refreshed once it is older than ``max_age`` seconds. If the download
+    fails, an older copy is still used. With ``offline=True`` nothing touches the
+    network. Raises ``FileNotFoundError`` when there is no copy to use.
+    """
+    path = os.path.join(cache_dir(), "vuln_names.jsonl.gz")
+    age = time.time() - os.path.getmtime(path) if os.path.isfile(path) else None
+    if age is not None and (offline or age < max_age):
+        log.debug("dataset: using cached %s (%.1f hours old)", path, age / 3600)
+        return path
+    if offline:
+        raise FileNotFoundError(f"no cached dataset at {path}, and offline mode is on")
+    log.debug("dataset: downloading %s", DATASET_URL)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(path)) as work_dir:
+            os.replace(_download(DATASET_URL, work_dir), path)
+    except OSError as error:
+        if age is None:
+            raise
+        log.warning("dataset: download failed (%s), using the cached copy", error)
+    return path
+
+
+def lookup_name(
+    cve_id: str, offline: bool = False, max_age: float = DATASET_MAX_AGE
+) -> Optional[VulnName]:
+    """Return the name the nightly dataset gives a CVE, or None if it is not listed.
+
+    Downloads the dataset on first use and caches it (see ``fetch_dataset``).
+    """
+    cve_id = cve_id.strip().upper()
+    needle = json.dumps(cve_id)
+    with gzip.open(fetch_dataset(offline, max_age), "rt", encoding="utf-8") as lines:
+        for line in lines:
+            if needle not in line:  # skip parsing the rows that cannot match
+                continue
+            entry = json.loads(line)
+            if entry.get("id") == cve_id:
+                log.debug(
+                    "dataset: %s found, named from %s, the best source when the dataset was built",
+                    cve_id,
+                    entry.get("source"),
+                )
+                return VulnName(entry.get("name"), entry.get("source"), entry.get("public_name"))
+    log.debug("dataset: %s is not listed", cve_id)
+    return None
 
 
 def _sha256(path: str) -> str:
@@ -1066,8 +1159,33 @@ def _build_command(args: argparse.Namespace) -> int:
 
 
 def _name_command(args: argparse.Namespace) -> int:
-    namer = ModelNamer(args.model, args.threads) if args.model else None
-    resolved = resolve_name(args.description, args.cve or "", namer=namer)
+    if args.cve and not _CVE_ID_RE.match(args.cve):
+        raise SystemExit(f"vulnamer: {args.cve!r} is not a CVE ID, use --description for free text")
+    if not args.cve and not args.description:
+        raise SystemExit("vulnamer: give a CVE ID, a --description, or both")
+    cve_id = (args.cve or "").upper()
+    if cve_id:
+        try:
+            found = lookup_name(cve_id, offline=args.offline)
+        except OSError as error:
+            if not args.description:
+                raise SystemExit(f"vulnamer: cannot read the dataset: {error}")
+            log.warning("dataset: unavailable (%s), naming the description instead", error)
+            found = None
+        if not args.description:
+            print(json.dumps((found or VulnName(None, None)).__dict__, ensure_ascii=False))
+            return 0
+        if found and found.name:
+            print(json.dumps(found.__dict__, ensure_ascii=False))
+            return 0
+        log.debug("dataset: no name for %s, naming the description instead", cve_id)
+    namer = None
+    if args.model is not None:
+        if args.model:
+            namer = ModelNamer(args.model, args.threads)
+        else:
+            namer = ModelNamer.load(args.threads, download=not args.offline)
+    resolved = resolve_name(args.description, cve_id, namer=namer)
     print(json.dumps(resolved.__dict__, ensure_ascii=False))
     return 0
 
@@ -1082,11 +1200,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    name = commands.add_parser("name", help="name a single vulnerability")
-    name.add_argument("description")
-    name.add_argument("--cve", help="CVE ID, used to look up its community name")
-    name.add_argument("--model", help="directory of the ONNX model")
+    name = commands.add_parser(
+        "name",
+        help="name a vulnerability",
+        description="Look a CVE up in the nightly dataset, or name a description.",
+    )
+    name.add_argument("cve", nargs="?", help="CVE ID to look up in the nightly dataset")
+    name.add_argument(
+        "-d", "--description", help="description to name, used when the CVE is not in the dataset"
+    )
+    name.add_argument(
+        "--model",
+        nargs="?",
+        const="",
+        help="run the model on the description: a model directory, or nothing for the published model",
+    )
+    name.add_argument("--offline", action="store_true", help="use only cached files")
     name.add_argument("--threads", type=int)
+    name.add_argument(
+        "-v", "--verbose", action="store_true", help="show which sources were checked, on stderr"
+    )
     name.set_defaults(run=_name_command)
 
     build = commands.add_parser("build", help="build the names dataset from public sources")
@@ -1102,7 +1235,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     model.set_defaults(run=_download_model_command)
 
     args = parser.parse_args(argv)
-    return args.run(args)
+    if not getattr(args, "verbose", False):
+        return args.run(args)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("[vulnamer] %(message)s"))
+    level = log.level
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
+    try:
+        return args.run(args)
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(level)
 
 
 if __name__ == "__main__":

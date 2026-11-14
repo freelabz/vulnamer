@@ -65,20 +65,66 @@ namer = ModelNamer.load()  # ModelNamer.load(download=False) never touches the n
 print(resolve_name("SQL injection in the login form of AcmeShop 2.1.", namer=namer).name)
 ```
 
-From the command line:
-
-```bash
-vulnamer download-model ./model
-vulnamer name "SQL injection in the login form of AcmeShop 2.1." --model ./model
-```
+From the command line, see [Command line](#command-line).
 
 The same description always gives the same name. The model runs one description at a time,
 because its int8 quantization would otherwise let a name depend on the rest of a batch.
 
-**Look names up.** `NAMES_URL` points to a smaller, names-only dataset with the fields `id`,
-`name` and `public_name`, for when you don't need the source of each name. `DATASET_URL`
-points to the full one. Both are gzipped JSON lines, rebuilt nightly, and `read_dataset`
-reads either.
+**Look names up.** `lookup_name("CVE-2026-109618")` downloads the nightly dataset on first
+use, caches it under `$XDG_CACHE_HOME/vulnamer` and refreshes it once it is a day old.
+`lookup_name(..., offline=True)` only reads the cache. `NAMES_URL` points to a smaller,
+names-only dataset with the fields `id`, `name` and `public_name`, for when you don't need
+the source of each name. `DATASET_URL` points to the full one. Both are gzipped JSON lines,
+and `read_dataset` reads either.
+
+## Command line
+
+`vulnamer name` looks a CVE up in the nightly dataset:
+
+```console
+$ vulnamer name CVE-2026-109618
+{"name": "PHP Memory Corruption", "source": "kev", "public_name": "PHP2Shell"}
+```
+
+Give a description too, and it is named when the CVE is not in the dataset yet. Add
+`--model` to run the published model on it, or `--model ./model` for a local copy:
+
+```bash
+vulnamer name CVE-2026-999999 -d "SQL injection in the login form of AcmeShop 2.1." --model
+vulnamer name -d "SQL injection in the login form of AcmeShop 2.1."   # no lookup
+```
+
+`-v` prints each step on stderr, so you can see which sources were checked and why each
+one was used or skipped. `--offline` only uses cached files.
+
+```console
+$ vulnamer name CVE-2099-0001 -d "SQL injection in the login form of AcmeShop 2.1." -v
+[vulnamer] dataset: using cached ~/.cache/vulnamer/vuln_names.jsonl.gz (2.3 hours old)
+[vulnamer] dataset: CVE-2099-0001 is not listed
+[vulnamer] dataset: no name for CVE-2099-0001, naming the description instead
+[vulnamer] nuclei: nothing given
+[vulnamer] kev: nothing given
+[vulnamer] ghsa: nothing given
+[vulnamer] cna: nothing given
+[vulnamer] vendor: no usable 'aka' title in the description
+[vulnamer] kernel: not a usable Linux kernel commit message
+[vulnamer] model: not used, no model loaded
+[vulnamer] heuristic: accepted 'login form of AcmeShop - SQL Injection'
+```
+
+When the dataset has the CVE, the log says which source named it. The other sources were
+checked when the dataset was built.
+
+In Python, the same messages go to the `vulnamer` logger at `DEBUG` level:
+
+```python
+import logging
+
+logging.basicConfig()
+logging.getLogger("vulnamer").setLevel(logging.DEBUG)
+```
+
+`vulnamer download-model [DIR]` fetches the model ahead of time.
 
 ## How a name is chosen
 
