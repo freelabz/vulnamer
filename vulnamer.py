@@ -715,6 +715,9 @@ class ModelNamer:
     EOS_ID = 1
 
     def __init__(self, model_dir: str, threads: Optional[int] = None):
+        missing = [name for name in MODEL_FILES if not os.path.isfile(os.path.join(model_dir, name))]
+        if missing:
+            raise FileNotFoundError(f"no vulnamer model in {model_dir}, missing {', '.join(missing)}")
         import numpy
         import onnxruntime
         from tokenizers import Tokenizer
@@ -738,7 +741,7 @@ class ModelNamer:
         """Load the published model from the cache, downloading it if it is missing.
 
         With ``download=False`` nothing touches the network, and a missing model
-        raises an error from ``onnxruntime``.
+        raises ``FileNotFoundError``.
         """
         return cls(download_model() if download else default_model_dir(), threads)
 
@@ -1254,7 +1257,7 @@ def _build_command(args: argparse.Namespace) -> int:
         public_names = mine_public_names(references, descriptions)
         del descriptions
 
-        namer = ModelNamer(args.model, args.threads) if args.model else None
+        namer = _load_namer(args.model, args.threads, False) if args.model else None
         previous = read_dataset(args.previous) if args.previous else None
         counts: Counter = Counter()
         names = gzip.open(args.names, "wt", encoding="utf-8") if args.names else None
@@ -1305,6 +1308,25 @@ def _no_name_hint(
     return " ".join(hints)
 
 
+def _load_namer(model_dir: str, threads: Optional[int], offline: bool) -> ModelNamer:
+    """Load the model for the CLI, turning setup problems into a message."""
+    try:
+        if model_dir:
+            return ModelNamer(model_dir, threads)
+        return ModelNamer.load(threads, download=not offline)
+    except ImportError:
+        raise SystemExit('vulnamer: the model needs the model extra: pip install "vulnamer[model]"')
+    except FileNotFoundError as error:
+        if model_dir:
+            raise SystemExit(
+                f"vulnamer: {error}. Use --model on its own for the published model,"
+                f" or run 'vulnamer download-model {model_dir}' to put it there."
+            )
+        raise SystemExit(f"vulnamer: {error}. Run once without --offline to download it.")
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"vulnamer: could not download the model: {error}")
+
+
 def _parse_sources(value: str) -> List[str]:
     names = [part.strip().lower() for part in value.split(",") if part.strip()]
     if names == ["all"]:
@@ -1330,11 +1352,8 @@ def _source_command(args: argparse.Namespace, cve_id: str) -> int:
     evidence.pop("description", None)
 
     namer = None
-    if "model" in sources and description:
-        if args.model:
-            namer = ModelNamer(args.model, args.threads)
-        elif _model_installed():
-            namer = ModelNamer.load(args.threads, download=not args.offline)
+    if "model" in sources and description and (args.model or _model_installed()):
+        namer = _load_namer(args.model, args.threads, args.offline)
     results = name_each_source(description, namer=namer, sources=sources, **evidence)
 
     feed_of = {"nuclei": "nuclei", "kev": "kev", "ghsa": "ghsa", "cna": "cve record"}
@@ -1397,10 +1416,7 @@ def _name_command(args: argparse.Namespace) -> int:
         if cve_id:
             log.debug("dataset: no name for %s, naming the description instead", cve_id)
         if args.model is not None:
-            if args.model:
-                namer = ModelNamer(args.model, args.threads)
-            else:
-                namer = ModelNamer.load(args.threads, download=not args.offline)
+            namer = _load_namer(args.model, args.threads, args.offline)
         result = resolve_name(args.description, cve_id, namer=namer)
     else:
         result = VulnName(None, None)

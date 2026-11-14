@@ -1136,6 +1136,48 @@ class TestSourceOption(unittest.TestCase):
         self.assertIn("cannot run with --offline", str(raised.exception))
 
 
+class TestModelSetupErrors(unittest.TestCase):
+    def setUp(self):
+        work = tempfile.TemporaryDirectory()
+        self.addCleanup(work.cleanup)
+        self.dir = work.name
+
+    def run_cli(self, *argv):
+        with self.assertRaises(SystemExit) as raised, redirect_stdout(io.StringIO()):
+            V.main(["name", "-d", "Shell injection on Command Error", *argv])
+        return str(raised.exception)
+
+    def test_directory_without_a_model(self):
+        with self.assertRaises(FileNotFoundError) as raised:
+            V.ModelNamer(self.dir)  # checked before onnxruntime is imported
+        self.assertIn("missing encoder_model.onnx, decoder_model.onnx, tokenizer.json", str(raised.exception))
+        message = self.run_cli("--model", self.dir)
+        self.assertIn(f"no vulnamer model in {self.dir}", message)
+        self.assertIn("Use --model on its own for the published model", message)
+        self.assertIn(f"vulnamer download-model {self.dir}", message)
+
+    def test_offline_without_a_cached_model(self):
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": self.dir}):
+            message = self.run_cli("--model", "--offline")
+        self.assertIn("Run once without --offline", message)
+
+    def test_missing_model_extra(self):
+        with mock.patch.object(V.ModelNamer, "load", side_effect=ImportError("No module named 'onnxruntime'")):
+            message = self.run_cli("--model")
+        self.assertIn('pip install "vulnamer[model]"', message)
+
+    def test_failed_download(self):
+        with mock.patch.object(V.ModelNamer, "load", side_effect=OSError("network is unreachable")):
+            message = self.run_cli("--model")
+        self.assertEqual(message, "vulnamer: could not download the model: network is unreachable")
+
+    def test_source_option_reports_it_too(self):
+        with mock.patch.object(V, "_http_get", log4j_feeds()), self.assertRaises(SystemExit) as raised:
+            with redirect_stdout(io.StringIO()):
+                V.main(["name", "CVE-2021-44228", "-s", "model", "--model", self.dir])
+        self.assertIn("no vulnamer model in", str(raised.exception))
+
+
 class TestModelDownload(unittest.TestCase):
     def setUp(self):
         self.work = tempfile.TemporaryDirectory()
