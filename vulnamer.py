@@ -970,10 +970,11 @@ def fetch_evidence(
 def _http_get(url: str, headers: Optional[Dict[str, str]] = None) -> bytes:
     """GET a URL, authenticated to the GitHub API when a token is set (higher rate limit)."""
     sent = {"User-Agent": f"vulnamer/{__version__}"}
+    request = urllib.request.Request(url, headers={**sent, **(headers or {})})
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token and urllib.parse.urlsplit(url).hostname == "api.github.com":
-        sent["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(url, headers={**sent, **(headers or {})})
+        # unredirected: urllib does not forward it if the API redirects to another host
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:  # nosec B310
         return response.read()
 
@@ -1277,7 +1278,7 @@ def stability_errors(previous: Dict[str, dict], new: Dict[str, dict]) -> List[st
         if current is None:
             errors.append(f"{cve_id}: missing (was {earlier.get('name')!r})")
             continue
-        for key in ("name", "public_name"):
+        for key in ("name", "public_name", "source"):
             if (earlier.get(key) or None) != (current.get(key) or None):
                 errors.append(f"{cve_id}: {key} {earlier.get(key)!r} -> {current.get(key)!r}")
     return errors

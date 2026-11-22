@@ -3,9 +3,20 @@ on:
   schedule:
     - cron: "15 1 * * *"
   workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: "Build from scratch when the dataset release has no files yet (first publish only)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+# Two overlapping runs would each name the same new CVEs from the same previous dataset,
+# and the second upload would overwrite names the first one just published.
+concurrency:
+  group: nightly-dataset
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -33,12 +44,21 @@ jobs:
             fi
             echo "$assets"; exit 1
           fi
-          if ! grep -qx 'vuln_names.jsonl.gz' <<<"$assets"; then
-            echo "::warning::the dataset release has no vuln_names.jsonl.gz yet, building from scratch"
-            exit 0
-          fi
+          # A release without its files means a publish failed half-way: rebuilding from
+          # scratch would re-resolve every name, so it needs an explicit bootstrap run.
+          for file in vuln_names.jsonl.gz vuln_names.min.jsonl.gz; do
+            if ! grep -qx "$file" <<<"$assets"; then
+              if [ "${{ inputs.bootstrap }}" = "true" ]; then
+                echo "::warning::the dataset release has no $file, bootstrapping from scratch"
+                exit 0
+              fi
+              echo "::error::the dataset release has no $file; restore it, or re-run with bootstrap=true"
+              exit 1
+            fi
+          done
           gh release download dataset --pattern 'vuln_names.jsonl.gz' --output previous.jsonl.gz
-          gzip -t previous.jsonl.gz
+          gh release download dataset --pattern 'vuln_names.min.jsonl.gz' --output previous.min.jsonl.gz
+          gzip -t previous.jsonl.gz previous.min.jsonl.gz
       - name: Build
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -48,7 +68,10 @@ jobs:
           vulnamer build vuln_names.jsonl.gz --names vuln_names.min.jsonl.gz --model model $PREVIOUS
       - name: Check published names are unchanged
         if: hashFiles('previous.jsonl.gz') != ''
-        run: vulnamer check-stable previous.jsonl.gz vuln_names.jsonl.gz
+        run: |
+          vulnamer check-stable previous.jsonl.gz vuln_names.jsonl.gz
+          # consumers read the min file: check it on its own too
+          vulnamer check-stable previous.min.jsonl.gz vuln_names.min.jsonl.gz
       - name: Checksums and manifest
         run: |
           sha256sum vuln_names.jsonl.gz vuln_names.min.jsonl.gz > SHA256SUMS
@@ -87,5 +110,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view dataset >/dev/null 2>&1 || gh release create dataset --title "Names dataset" --notes "Nightly names dataset."
-          gh release upload dataset vuln_names.jsonl.gz vuln_names.min.jsonl.gz SHA256SUMS manifest.json --clobber
+          gh release view dataset >/dev/null 2>&1 || gh release create dataset --latest=false --title "Names dataset" --notes "Nightly names dataset."
+          # data files first, then the checksums and manifest that describe them
+          gh release upload dataset vuln_names.jsonl.gz vuln_names.min.jsonl.gz --clobber
+          gh release upload dataset SHA256SUMS manifest.json --clobber

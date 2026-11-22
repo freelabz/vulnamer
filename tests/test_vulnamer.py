@@ -579,11 +579,19 @@ class TestCheckStable(unittest.TestCase):
             "CVE-3": {"id": "CVE-3", "name": "Baz - Odd Flaw", "source": "model"},
             "CVE-4": {"id": "CVE-4", "name": "Qux - Odd Flaw", "source": "model"},
         }
-        new["CVE-1"] = {**new["CVE-1"], "source": "kev", "description_hash": "x"}
+        new["CVE-1"] = {**new["CVE-1"], "description_hash": "x"}
         self.assertEqual(V.stability_errors(self.PREVIOUS, new), [])
 
+    def test_changed_source_fails(self):
+        new = {**self.PREVIOUS, "CVE-1": {**self.PREVIOUS["CVE-1"], "source": "kev"}}
+        self.assertEqual(V.stability_errors(self.PREVIOUS, new), ["CVE-1: source 'model' -> 'kev'"])
+
+    def test_min_files_without_source_compare(self):
+        previous = {"CVE-1": {"id": "CVE-1", "name": "Foo - Odd Flaw"}}
+        self.assertEqual(V.stability_errors(previous, dict(previous)), [])
+
     def test_changed_name_fails(self):
-        new = {**self.PREVIOUS, "CVE-1": {"id": "CVE-1", "name": "Foo - Other Flaw"}}
+        new = {**self.PREVIOUS, "CVE-1": {"id": "CVE-1", "name": "Foo - Other Flaw", "source": "model"}}
         self.assertEqual(
             V.stability_errors(self.PREVIOUS, new),
             ["CVE-1: name 'Foo - Odd Flaw' -> 'Foo - Other Flaw'"],
@@ -600,7 +608,7 @@ class TestCheckStable(unittest.TestCase):
     def test_removed_name_fails(self):
         new = {k: v for k, v in self.PREVIOUS.items() if k != "CVE-2"}
         self.assertEqual(V.stability_errors(self.PREVIOUS, new), ["CVE-2: missing (was None)"])
-        new = {**self.PREVIOUS, "CVE-1": {"id": "CVE-1", "name": None}}
+        new = {**self.PREVIOUS, "CVE-1": {"id": "CVE-1", "name": None, "source": "model"}}
         self.assertEqual(len(V.stability_errors(self.PREVIOUS, new)), 1)
 
     def test_command_exit_codes(self):
@@ -630,6 +638,7 @@ class TestHttpGet(unittest.TestCase):
 
         def urlopen(request, timeout):
             sent.update({k.lower(): v for k, v in request.header_items()})
+            sent["_redirected"] = {k.lower() for k in request.headers}
             return Response(b"{}")
 
         with mock.patch.object(V.urllib.request, "urlopen", urlopen), mock.patch.dict(
@@ -642,6 +651,7 @@ class TestHttpGet(unittest.TestCase):
         for name in ("GITHUB_TOKEN", "GH_TOKEN"):
             sent = self.headers_sent(V.CVELIST_RELEASE_API, {name: "secret"})
             self.assertEqual(sent["authorization"], "Bearer secret")
+            self.assertNotIn("authorization", sent["_redirected"])  # not forwarded on redirect
 
     def test_token_stays_off_other_hosts_and_is_optional(self):
         self.assertNotIn("authorization", self.headers_sent(V.KEV_URL, {"GITHUB_TOKEN": "secret"}))
