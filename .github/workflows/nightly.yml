@@ -24,13 +24,68 @@ jobs:
         run: |
           gh release download model-v1 --pattern 'vulnamer-model.tar.gz'
           mkdir model && tar -xzf vulnamer-model.tar.gz -C model
-          gh release download dataset --pattern 'vuln_names.jsonl.gz' --output previous.jsonl.gz || true
+          # Published names are append-only, so the previous dataset is required. Start from
+          # scratch only when nothing was ever published; any other failure stops the build.
+          if ! assets=$(gh release view dataset --json assets --jq '.assets[].name' 2>&1); then
+            if grep -q "release not found" <<<"$assets"; then
+              echo "::warning::no dataset release yet, building from scratch"
+              exit 0
+            fi
+            echo "$assets"; exit 1
+          fi
+          if ! grep -qx 'vuln_names.jsonl.gz' <<<"$assets"; then
+            echo "::warning::the dataset release has no vuln_names.jsonl.gz yet, building from scratch"
+            exit 0
+          fi
+          gh release download dataset --pattern 'vuln_names.jsonl.gz' --output previous.jsonl.gz
+          gzip -t previous.jsonl.gz
       - name: Build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           PREVIOUS=""
           if [ -f previous.jsonl.gz ]; then PREVIOUS="--previous previous.jsonl.gz"; fi
           vulnamer build vuln_names.jsonl.gz --names vuln_names.min.jsonl.gz --model model $PREVIOUS
+      - name: Check published names are unchanged
+        if: hashFiles('previous.jsonl.gz') != ''
+        run: vulnamer check-stable previous.jsonl.gz vuln_names.jsonl.gz
+      - name: Checksums and manifest
+        run: |
+          sha256sum vuln_names.jsonl.gz vuln_names.min.jsonl.gz > SHA256SUMS
+          python - <<'PY'
+          import datetime, gzip, hashlib, json
+
+          def rows(path):
+              with gzip.open(path, "rt", encoding="utf-8") as lines:
+                  return [json.loads(line) for line in lines]
+
+          def sha256(path):
+              with open(path, "rb") as handle:
+                  return hashlib.file_digest(handle, "sha256").hexdigest()
+
+          full = rows("vuln_names.jsonl.gz")
+          names = rows("vuln_names.min.jsonl.gz")
+          manifest = {
+              "schema_version": 1,
+              "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "counts": {
+                  "records": len(full),
+                  "named": len(names),
+                  "with_public_name": sum(1 for row in names if row.get("public_name")),
+              },
+              "files": {
+                  path: {"sha256": sha256(path)}
+                  for path in ("vuln_names.jsonl.gz", "vuln_names.min.jsonl.gz")
+              },
+          }
+          with open("manifest.json", "w") as output:
+              json.dump(manifest, output, indent=2)
+              output.write("\n")
+          PY
+          cat SHA256SUMS manifest.json
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload dataset vuln_names.jsonl.gz vuln_names.min.jsonl.gz --clobber
+        run: |
+          gh release view dataset >/dev/null 2>&1 || gh release create dataset --title "Names dataset" --notes "Nightly names dataset."
+          gh release upload dataset vuln_names.jsonl.gz vuln_names.min.jsonl.gz SHA256SUMS manifest.json --clobber
