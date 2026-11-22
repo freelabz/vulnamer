@@ -211,9 +211,39 @@ against the table with a source.
 vulnamer build vuln_names.jsonl.gz --model ./model --previous old.jsonl.gz
 ```
 
-This downloads the sources and names every published CVE. With `--previous`, the model
-only runs for CVEs that have no reusable output. Reused names still pass through the
-current guard. Without `--previous`, a full run takes hours on CPU.
+This downloads the sources and names every published CVE. With `--previous`, every CVE
+the earlier dataset already names is kept as published (see [Stability](#stability)), and
+the model only runs for CVEs that are still unnamed and whose description changed. Without
+`--previous`, a full run takes hours on CPU.
+
+```bash
+vulnamer check-stable old.jsonl.gz vuln_names.jsonl.gz
+```
+
+exits non-zero if the new dataset drops or changes any published name. The nightly build
+runs it before publishing.
+
+## Stability
+
+Downstream consumers display the name (`public_name` if set, else `name`) and may dedup
+findings on it, so published names are **append-only**:
+
+- once a CVE is published with a `name` or a `public_name`, every later dataset carries
+  the same `name`, `public_name` and `source`, even if the sources, the guard or the
+  model change, and even if the CVE leaves the CVE List;
+- a CVE without a name can get one later; that is the only change a name can see;
+- a `public_name` is never added to, or changed on, a CVE that is already named, since it
+  would change what is displayed. This includes new entries in the reviewed public-name
+  table: they only apply to CVEs that are not named yet;
+- a CVE that is later rejected keeps its published name.
+
+The nightly fails rather than publish a dataset that breaks this: it requires the previous
+release files, checks both the full and the names file with `check-stable`, and never runs
+two builds at once. Building from scratch needs a manual run with `bootstrap=true`.
+
+The names file (`vuln_names.min.jsonl.gz`, one `{"id", "name", "public_name"}` object per
+line, empty keys omitted) is a stable contract. Each nightly release also carries
+`SHA256SUMS` and a `manifest.json` (build time, counts, checksums, schema version).
 
 ## Development
 

@@ -377,19 +377,31 @@ class TestBuildDataset(unittest.TestCase):
         self.assertEqual(rows["CVE-1"]["source"], "model")
         self.assertEqual(rows["CVE-2"]["source"], "cna")
 
-    def test_curated_name_that_stopped_applying_reaches_the_model(self):
+    def test_published_curated_name_survives_a_changed_source_title(self):
         description = "Foo has an odd flaw."
         previous = {
             "CVE-1": {
-                "name": "Foo Advisory Title",
+                "id": "CVE-1",
+                "name": "Foo Portal - Stored XSS",
                 "source": "ghsa",
                 "description_hash": V.description_hash(description),
             }
         }
         namer = FakeNamer("Foo - Odd Flaw")
-        rows = list(V.build_dataset([("CVE-1", description, "")], {}, {}, {}, {}, namer, previous))
-        self.assertEqual(namer.calls, [description])
-        self.assertEqual(rows[0]["source"], "model")
+        ghsa = {"CVE-1": "Foo Portal - Reflected Cross-Site Scripting In Search"}
+        rows = list(
+            V.build_dataset([("CVE-1", description, "")], {}, {}, ghsa, {}, namer, previous)
+        )
+        self.assertEqual((rows[0]["name"], rows[0]["source"]), ("Foo Portal - Stored XSS", "ghsa"))
+        self.assertEqual(namer.calls, [])
+
+    def test_published_curated_name_survives_its_source_disappearing(self):
+        previous = {"CVE-2": {"id": "CVE-2", "name": "Bar Portal - Stored XSS", "source": "cna"}}
+        rows = list(
+            V.build_dataset([("CVE-2", "Bar has an odd flaw.", "")], {}, {}, {}, {}, None, previous)
+        )
+        self.assertEqual((rows[0]["name"], rows[0]["source"]), ("Bar Portal - Stored XSS", "cna"))
+        self.assertEqual(rows[0]["description_hash"], V.description_hash("Bar has an odd flaw."))
 
     def test_model_names_one_description_at_a_time(self):
         class OneAtATime(FakeNamer):
@@ -437,7 +449,7 @@ class TestBuildDataset(unittest.TestCase):
         self.assertEqual(rows[0]["name"], "Foo - Odd Flaw")
         self.assertEqual(namer.calls, [])
 
-    def test_reused_name_the_guard_now_rejects_is_dropped(self):
+    def test_published_name_is_kept_even_if_the_guard_now_rejects_it(self):
         previous = {
             "CVE-1": {
                 "name": "Invented Product - Odd Flaw",
@@ -446,14 +458,82 @@ class TestBuildDataset(unittest.TestCase):
             }
         }
         rows = list(V.build_dataset(self.RECORDS[:1], {}, {}, {}, {}, FakeNamer(), previous))
-        self.assertIsNone(rows[0]["name"])
+        self.assertEqual(rows[0]["name"], "Invented Product - Odd Flaw")
 
-    def test_changed_description_runs_the_model_again(self):
+    def test_published_model_name_survives_a_changed_description(self):
         namer = FakeNamer("Foo - Odd Flaw")
         previous = {"CVE-1": {"name": "Old", "source": "model", "description_hash": "0"}}
         rows = list(V.build_dataset(self.RECORDS[:1], {}, {}, {}, {}, namer, previous))
-        self.assertEqual(rows[0]["name"], "Foo - Odd Flaw")
+        self.assertEqual((rows[0]["name"], rows[0]["source"]), ("Old", "model"))
+        self.assertEqual(rows[0]["description_hash"], V.description_hash("Foo has an odd flaw."))
+        self.assertEqual(namer.calls, [])
+
+    def test_unnamed_cve_with_a_changed_description_runs_the_model_again(self):
+        namer = FakeNamer("Foo - Odd Flaw")
+        previous = {"CVE-1": {"id": "CVE-1", "name": None, "source": None, "description_hash": "0"}}
+        rows = list(V.build_dataset(self.RECORDS[:1], {}, {}, {}, {}, namer, previous))
+        self.assertEqual((rows[0]["name"], rows[0]["source"]), ("Foo - Odd Flaw", "model"))
         self.assertEqual(len(namer.calls), 1)
+
+    def test_unnamed_cve_with_an_unchanged_description_skips_the_model(self):
+        namer = FakeNamer("Foo - Odd Flaw")
+        previous = {
+            "CVE-1": {
+                "id": "CVE-1",
+                "name": None,
+                "source": None,
+                "description_hash": V.description_hash("Foo has an odd flaw."),
+            }
+        }
+        rows = list(V.build_dataset(self.RECORDS[:1], {}, {}, {}, {}, namer, previous))
+        self.assertIsNone(rows[0]["name"])
+        self.assertEqual(namer.calls, [])
+
+    def test_unnamed_cve_can_get_its_first_name_from_a_new_source(self):
+        previous = {"CVE-1": {"id": "CVE-1", "name": None, "source": None}}
+        nuclei = {"CVE-1": "Foo Server - Remote Code Execution"}
+        rows = list(V.build_dataset(self.RECORDS[:1], nuclei, {}, {}, {}, None, previous))
+        self.assertEqual(
+            (rows[0]["name"], rows[0]["source"]), ("Foo Server - Remote Code Execution", "nuclei")
+        )
+
+    def test_public_name_is_frozen_once_published(self):
+        previous = {
+            "CVE-1": {"id": "CVE-1", "name": "Foo - Odd Flaw", "source": "model"},
+            "CVE-2": {"id": "CVE-2", "name": "Bar Portal - Stored XSS", "source": "cna",
+                      "public_name": "BarBleed"},
+        }
+        mined = {"CVE-1": "FooShell", "CVE-2": "BarShell"}
+        rows = {r["id"]: r for r in V.build_dataset(self.RECORDS, {}, {}, {}, mined, None, previous)}
+        self.assertNotIn("public_name", rows["CVE-1"])  # adding one would change the display
+        self.assertEqual(rows["CVE-2"]["public_name"], "BarBleed")
+
+    def test_public_name_only_entry_is_frozen(self):
+        previous = {"CVE-1": {"id": "CVE-1", "name": None, "source": None, "public_name": "FooShell"}}
+        nuclei = {"CVE-1": "Foo Server - Remote Code Execution"}
+        rows = list(V.build_dataset(self.RECORDS[:1], nuclei, {}, {}, {}, None, previous))
+        self.assertEqual((rows[0]["name"], rows[0]["public_name"]), (None, "FooShell"))
+
+    def test_published_cve_missing_from_the_records_is_carried_forward(self):
+        previous = {
+            "CVE-9": {"id": "CVE-9", "name": "Gone - Odd Flaw", "source": "model",
+                      "public_name": "GoneShell", "description_hash": "abc"},
+            "CVE-8": {"id": "CVE-8", "name": None, "source": None},
+        }
+        rows = {r["id"]: r for r in V.build_dataset(self.RECORDS, {}, {}, {}, {}, None, previous)}
+        self.assertEqual(rows["CVE-9"], previous["CVE-9"])
+        self.assertNotIn("CVE-8", rows)  # nothing was published for it
+        self.assertEqual(rows["CVE-2"]["name"], "Bar Portal - Stored XSS")  # new CVEs still named
+
+    def test_rebuild_passes_the_stability_check(self):
+        first = {r["id"]: r for r in V.build_dataset(self.RECORDS, {}, {}, {}, {}, FakeNamer("Foo - Odd Flaw"))}
+        records = [("CVE-1", "Foo has a different flaw now.", ""), ("CVE-3", "Baz has an odd flaw.", "")]
+        second = {
+            r["id"]: r
+            for r in V.build_dataset(records, {}, {}, {}, {"CVE-1": "FooShell"}, FakeNamer("Baz - Odd Flaw"), first)
+        }
+        self.assertEqual(V.stability_errors(first, second), [])
+        self.assertEqual(second["CVE-3"]["name"], "Baz - Odd Flaw")
 
     def test_rejected_model_output_falls_back(self):
         record = [("CVE-1", "SQL injection vulnerability in Foo CMS 1.0 allows attackers.", "")]
@@ -475,6 +555,107 @@ class TestBuildDataset(unittest.TestCase):
                     json.dumps({"id": "CVE-1", "name": "Foo Bär"}, ensure_ascii=False) + "\n"
                 )
             self.assertEqual(V.read_dataset(path)["CVE-1"]["name"], "Foo Bär")
+
+
+def _write_dataset(path, rows):
+    with gzip.open(path, "wt", encoding="utf-8") as output:
+        for row in rows:
+            output.write(json.dumps(row) + "\n")
+
+
+class TestCheckStable(unittest.TestCase):
+    PREVIOUS = {
+        "CVE-1": {"id": "CVE-1", "name": "Foo - Odd Flaw", "source": "model"},
+        "CVE-2": {"id": "CVE-2", "name": None, "source": None, "public_name": "BarShell"},
+        "CVE-3": {"id": "CVE-3", "name": None, "source": None},
+    }
+
+    def test_identical_data_is_stable(self):
+        self.assertEqual(V.stability_errors(self.PREVIOUS, dict(self.PREVIOUS)), [])
+
+    def test_appended_data_is_stable(self):
+        new = {
+            **self.PREVIOUS,
+            "CVE-3": {"id": "CVE-3", "name": "Baz - Odd Flaw", "source": "model"},
+            "CVE-4": {"id": "CVE-4", "name": "Qux - Odd Flaw", "source": "model"},
+        }
+        new["CVE-1"] = {**new["CVE-1"], "description_hash": "x"}
+        self.assertEqual(V.stability_errors(self.PREVIOUS, new), [])
+
+    def test_changed_source_fails(self):
+        new = {**self.PREVIOUS, "CVE-1": {**self.PREVIOUS["CVE-1"], "source": "kev"}}
+        self.assertEqual(V.stability_errors(self.PREVIOUS, new), ["CVE-1: source 'model' -> 'kev'"])
+
+    def test_min_files_without_source_compare(self):
+        previous = {"CVE-1": {"id": "CVE-1", "name": "Foo - Odd Flaw"}}
+        self.assertEqual(V.stability_errors(previous, dict(previous)), [])
+
+    def test_changed_name_fails(self):
+        new = {**self.PREVIOUS, "CVE-1": {"id": "CVE-1", "name": "Foo - Other Flaw", "source": "model"}}
+        self.assertEqual(
+            V.stability_errors(self.PREVIOUS, new),
+            ["CVE-1: name 'Foo - Odd Flaw' -> 'Foo - Other Flaw'"],
+        )
+
+    def test_added_or_changed_public_name_fails(self):
+        new = {
+            **self.PREVIOUS,
+            "CVE-1": {**self.PREVIOUS["CVE-1"], "public_name": "FooShell"},
+            "CVE-2": {**self.PREVIOUS["CVE-2"], "public_name": "BarBleed"},
+        }
+        self.assertEqual(len(V.stability_errors(self.PREVIOUS, new)), 2)
+
+    def test_removed_name_fails(self):
+        new = {k: v for k, v in self.PREVIOUS.items() if k != "CVE-2"}
+        self.assertEqual(V.stability_errors(self.PREVIOUS, new), ["CVE-2: missing (was None)"])
+        new = {**self.PREVIOUS, "CVE-1": {"id": "CVE-1", "name": None, "source": "model"}}
+        self.assertEqual(len(V.stability_errors(self.PREVIOUS, new)), 1)
+
+    def test_command_exit_codes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old, same, changed = (os.path.join(directory, f"{n}.jsonl.gz") for n in "abc")
+            _write_dataset(old, self.PREVIOUS.values())
+            _write_dataset(same, self.PREVIOUS.values())
+            _write_dataset(changed, [{"id": "CVE-1", "name": "Renamed"}])
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(V.main(["check-stable", old, same]), 0)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                self.assertEqual(V.main(["check-stable", old, changed]), 1)
+            self.assertIn("CVE-1: name 'Foo - Odd Flaw' -> 'Renamed'", stderr.getvalue())
+
+
+class TestHttpGet(unittest.TestCase):
+    def headers_sent(self, url, env):
+        sent = {}
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def urlopen(request, timeout):
+            sent.update({k.lower(): v for k, v in request.header_items()})
+            sent["_redirected"] = {k.lower() for k in request.headers}
+            return Response(b"{}")
+
+        with mock.patch.object(V.urllib.request, "urlopen", urlopen), mock.patch.dict(
+            os.environ, env, clear=True
+        ):
+            V._http_get(url)
+        return sent
+
+    def test_github_api_gets_the_token(self):
+        for name in ("GITHUB_TOKEN", "GH_TOKEN"):
+            sent = self.headers_sent(V.CVELIST_RELEASE_API, {name: "secret"})
+            self.assertEqual(sent["authorization"], "Bearer secret")
+            self.assertNotIn("authorization", sent["_redirected"])  # not forwarded on redirect
+
+    def test_token_stays_off_other_hosts_and_is_optional(self):
+        self.assertNotIn("authorization", self.headers_sent(V.KEV_URL, {"GITHUB_TOKEN": "secret"}))
+        self.assertNotIn("authorization", self.headers_sent(V.CVELIST_RELEASE_API, {}))
 
 
 class TestRealWorldShapes(unittest.TestCase):
@@ -671,8 +852,14 @@ class TestRealWorldShapes(unittest.TestCase):
         rows = list(
             V.build_dataset([("CVE-1", description, "")], {}, {}, {}, {}, namer, previous)
         )
-        self.assertEqual(rows[0]["name"], "MySQL Server - Denial of Service")
+        # published names are append-only, so the guard does not rewrite them
+        self.assertEqual(rows[0]["name"], previous["CVE-1"]["name"])
         self.assertEqual(namer.calls, [])
+        # but a name produced for the first time does go through it
+        self.assertEqual(
+            V.check_generated_name(previous["CVE-1"]["name"], description),
+            "MySQL Server - Denial of Service",
+        )
 
 
 class TestKernelThroughThePipeline(unittest.TestCase):
@@ -1050,15 +1237,11 @@ class TestFetchEvidence(unittest.TestCase):
         self.fetch(feeds, ["heuristic"])
         self.assertEqual(feeds.requested, [V.CVE_RECORD_URL.format(cve_id="CVE-2021-44228")])
 
-    def test_asks_github_for_reviewed_advisories_with_a_token_if_set(self):
+    def test_asks_github_for_reviewed_advisories(self):
         self.assertIn("type=reviewed", V.GHSA_API_URL)
         feeds = log4j_feeds()
-        self.fetch(feeds, ["ghsa"], env={"GITHUB_TOKEN": "secret"})
-        url = V.GHSA_API_URL.format(cve_id="CVE-2021-44228")
-        self.assertEqual(feeds.headers[url], {"Authorization": "Bearer secret"})
-        feeds = log4j_feeds()
         self.fetch(feeds, ["ghsa"])
-        self.assertEqual(feeds.headers[url], {})
+        self.assertIn(V.GHSA_API_URL.format(cve_id="CVE-2021-44228"), feeds.requested)
 
     def test_reports_what_could_not_be_fetched(self):
         evidence, errors = self.fetch(FakeFeeds(), ["cna", "kev"])
