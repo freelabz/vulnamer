@@ -30,6 +30,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from collections import Counter, defaultdict
@@ -956,10 +957,8 @@ def fetch_evidence(
         if feed is not None:
             evidence["nuclei_name"] = feed.get(cve_id)
     if "ghsa" in sources:
-        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
         advisories = attempt(
-            "ghsa", lambda: json.loads(_http_get(GHSA_API_URL.format(cve_id=cve_id), headers))
+            "ghsa", lambda: json.loads(_http_get(GHSA_API_URL.format(cve_id=cve_id)))
         )
         if advisories is not None:
             summaries = [item.get("summary") for item in advisories if item.get("summary")]
@@ -969,9 +968,12 @@ def fetch_evidence(
 
 
 def _http_get(url: str, headers: Optional[Dict[str, str]] = None) -> bytes:
-    request = urllib.request.Request(
-        url, headers={"User-Agent": f"vulnamer/{__version__}", **(headers or {})}
-    )
+    """GET a URL, authenticated to the GitHub API when a token is set (higher rate limit)."""
+    sent = {"User-Agent": f"vulnamer/{__version__}"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token and urllib.parse.urlsplit(url).hostname == "api.github.com":
+        sent["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers={**sent, **(headers or {})})
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:  # nosec B310
         return response.read()
 
@@ -1191,6 +1193,23 @@ def names_entry(result: dict) -> Optional[dict]:
     return {key: result[key] for key in keys if result.get(key)}
 
 
+def is_published(entry: Optional[dict]) -> bool:
+    """Whether a dataset row carries a name downstream consumers may already display."""
+    return bool(entry and (entry.get("name") or entry.get("public_name")))
+
+
+def _frozen(earlier: dict, description: Optional[str] = None) -> dict:
+    """Repeat a published row as it was, refreshing only its description hash."""
+    result = {"id": earlier["id"], "name": earlier.get("name"), "source": earlier.get("source")}
+    if earlier.get("public_name"):
+        result["public_name"] = earlier["public_name"]
+    if description is not None:
+        result["description_hash"] = description_hash(description)
+    elif earlier.get("description_hash"):
+        result["description_hash"] = earlier["description_hash"]
+    return result
+
+
 def build_dataset(
     records: Iterable[Tuple[str, str, str]],
     nuclei: Dict[str, str],
@@ -1200,7 +1219,13 @@ def build_dataset(
     namer: Optional[ModelNamer] = None,
     previous: Optional[Dict[str, dict]] = None,
 ) -> Iterator[dict]:
-    """Resolve names for all records, running the model only where it is needed."""
+    """Resolve names for all records, running the model only where it is needed.
+
+    Published names are append-only: a CVE that ``previous`` already names (``name``
+    or ``public_name``) is repeated exactly as published, whatever the sources or the
+    model now say, and is still emitted after it leaves the CVE List. Only CVEs that
+    are not yet named get resolved.
+    """
     previous = previous or {}
 
     def entry(cve_id, description, title, generated=None):
@@ -1220,23 +1245,53 @@ def build_dataset(
         result["description_hash"] = description_hash(description)
         return result
 
+    seen: Set[str] = set()
     for cve_id, description, title in records:
+        seen.add(cve_id)
+        earlier = previous.get(cve_id)
+        if is_published(earlier):
+            yield _frozen({**earlier, "id": cve_id}, description)
+            continue
         result = entry(cve_id, description, title)
         if result["source"] not in (None, "heuristic") or not namer or not description:
             yield result
             continue
-        earlier = previous.get(cve_id)
-        unchanged = earlier and earlier.get("description_hash") == result["description_hash"]
-        # a curated name that no longer applies says nothing about the model's output
-        if unchanged and earlier.get("source") in ("model", "heuristic", None):
-            reused = earlier.get("source") == "model" and check_generated_name(
-                earlier["name"], description
-            )
-            if reused:
-                result.update(name=reused, source="model")
+        # the model found nothing usable last time and the description has not changed
+        if earlier and earlier.get("description_hash") == result["description_hash"]:
             yield result
             continue
         yield entry(cve_id, description, title, namer.name([description])[0] or "")
+
+    for cve_id, earlier in previous.items():
+        if cve_id not in seen and is_published(earlier):
+            yield _frozen({**earlier, "id": cve_id})
+
+
+def stability_errors(previous: Dict[str, dict], new: Dict[str, dict]) -> List[str]:
+    """List every published name that ``new`` drops or changes compared to ``previous``."""
+    errors = []
+    for cve_id, earlier in sorted(previous.items()):
+        if not is_published(earlier):
+            continue
+        current = new.get(cve_id)
+        if current is None:
+            errors.append(f"{cve_id}: missing (was {earlier.get('name')!r})")
+            continue
+        for key in ("name", "public_name"):
+            if (earlier.get(key) or None) != (current.get(key) or None):
+                errors.append(f"{cve_id}: {key} {earlier.get(key)!r} -> {current.get(key)!r}")
+    return errors
+
+
+def _check_stable_command(args: argparse.Namespace) -> int:
+    errors = stability_errors(read_dataset(args.previous), read_dataset(args.new))
+    for error in errors[:50]:
+        print(f"[-] {error}", file=sys.stderr)
+    if errors:
+        print(f"[-] {len(errors)} published names changed or disappeared", file=sys.stderr)
+        return 1
+    print("[+] All published names are unchanged", file=sys.stderr)
+    return 0
 
 
 def _build_command(args: argparse.Namespace) -> int:
@@ -1493,10 +1548,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     build = commands.add_parser("build", help="build the names dataset from public sources")
     build.add_argument("output", help="output file (.jsonl.gz)")
     build.add_argument("--model", help="directory of the ONNX model")
-    build.add_argument("--previous", help="earlier dataset, to reuse model output")
+    build.add_argument(
+        "--previous", help="earlier dataset: its names are kept as published, see README"
+    )
     build.add_argument("--names", help="also write a smaller, names-only file (.jsonl.gz)")
     build.add_argument("--threads", type=int)
     build.set_defaults(run=_build_command)
+
+    stable = commands.add_parser(
+        "check-stable",
+        help="fail if a published name changed",
+        description="Exit non-zero if NEW drops or renames a CVE that PREVIOUS names.",
+    )
+    stable.add_argument("previous", help="the dataset already published (.jsonl.gz)")
+    stable.add_argument("new", help="the dataset about to be published (.jsonl.gz)")
+    stable.set_defaults(run=_check_stable_command)
 
     model = commands.add_parser("download-model", help="download the published model")
     model.add_argument("directory", nargs="?", help="default: the user cache")
