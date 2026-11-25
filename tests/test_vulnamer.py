@@ -334,11 +334,15 @@ class TestParsers(unittest.TestCase):
             "containers": {"cna": {"descriptions": [{"lang": "en", "value": description}]}},
         }
 
-    def _zip(self, directory, name, records):
+    def _zip(self, directory, name, records, nested=False):
         path = os.path.join(directory, name)
-        with zipfile.ZipFile(path, "w") as archive:
+        content = io.BytesIO() if nested else path
+        with zipfile.ZipFile(content, "w") as archive:
             for record in records:
                 archive.writestr(f"deltaCves/{record['cveMetadata']['cveId']}.json", json.dumps(record))
+        if nested:
+            with zipfile.ZipFile(path, "w") as outer:
+                outer.writestr("cves.zip", content.getvalue())
         return path
 
     def test_delta_overrides_bulk(self):
@@ -366,17 +370,17 @@ class TestParsers(unittest.TestCase):
             delta = self._zip(directory, "delta.zip", [self._cve("CVE-2", "", "REJECTED")])
             self.assertEqual(list(V.iter_cvelist(bulk, delta)), [("CVE-1", "Foo", "")])
 
-    def _build(self, directory, published):
-        bulk = self._zip(directory, "bulk.zip", [self._cve("CVE-1", "Foo", published="2026-11-23T10:00:00Z")])
+    def _build(self, directory, published, delta_day="2026-11-25"):
+        bulk = self._zip(directory, "bulk.zip", [self._cve("CVE-1", "Foo", published="2026-11-23T10:00:00Z")], nested=True)
         delta = self._zip(directory, "delta.zip", [self._cve("CVE-2", "Bar", published=published)])
         release = {
             "assets": [
-                {"browser_download_url": "https://x/2026-11-24_all_CVEs_at_midnight.zip.zip"},
-                {"browser_download_url": "https://x/2026-11-24_delta_CVEs_at_1200Z.zip"},
+                {"browser_download_url": f"https://x/{delta_day}_delta_CVEs_at_1200Z.zip"},
+                {"browser_download_url": "https://x/2026-11-25_all_CVEs_at_midnight.zip.zip"},
             ]
         }
         responses = {V.NUCLEI_CVES_URL: b"", V.KEV_URL: b"{}", V.CVELIST_RELEASE_API: json.dumps(release).encode()}
-        downloads = {release["assets"][0]["browser_download_url"]: bulk, release["assets"][1]["browser_download_url"]: delta}
+        downloads = {release["assets"][1]["browser_download_url"]: bulk, release["assets"][0]["browser_download_url"]: delta}
         output = os.path.join(directory, "out.jsonl.gz")
         args = mock.Mock(output=output, names=None, model=None, previous=None, threads=None)
         stderr = io.StringIO()
@@ -403,6 +407,13 @@ class TestParsers(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("stale", stderr)
             self.assertFalse(os.path.exists(output))
+
+    def test_build_ignores_a_delta_of_another_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # the bulk archive alone is 50 h old: the delta of the day before must not be read
+            code, _, stderr = self._build(directory, "2026-11-25T01:00:00.000Z", delta_day="2026-11-24")
+            self.assertEqual(code, 1)
+            self.assertIn("2026-11-23T10:00:00Z", stderr)
 
     def _tarball(self, directory, files):
         path = os.path.join(directory, "data.tar.gz")

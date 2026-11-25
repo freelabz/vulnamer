@@ -1314,30 +1314,37 @@ def _check_stable_command(args: argparse.Namespace) -> int:
 
 def _build_command(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory() as work_dir:
+        release = json.loads(_http_get(CVELIST_RELEASE_API))
+        assets = [asset["browser_download_url"] for asset in release["assets"]]
+        bulk = next(url for url in assets if "all_CVEs_at_midnight" in url)
+        cvelist = _download(bulk, work_dir)
+        # the delta of the same day adds what changed since that midnight
+        day = bulk.rsplit("/", 1)[-1][:10]
+        changes = next((url for url in assets if f"/{day}_delta_CVEs_at_" in url), None)
+        delta = _download(changes, work_dir) if changes else None
+
+        # a stale CVE List would publish a dataset that misses the newest CVEs: fail instead
+        newest = max(
+            (
+                record.get("cveMetadata", {}).get("datePublished") or ""
+                for path in filter(None, (cvelist, delta))
+                for record in iter_cve_records(path)
+            ),
+            default="",
+        )
+        try:
+            age = time.time() - calendar.timegm(time.strptime(newest[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            age = float("inf")
+        if age > 36 * 3600:
+            print(f"[-] The CVE List is stale: its newest CVE was published at {newest or 'no date'}", file=sys.stderr)
+            return 1
+
         print("[+] Downloading name sources", file=sys.stderr)
         nuclei = parse_nuclei(_http_get(NUCLEI_CVES_URL).decode())
         kev = parse_kev(_http_get(KEV_URL).decode())
         ghsa = dict(iter_ghsa_summaries(_download(GHSA_TARBALL_URL, work_dir)))
         references = list(iter_poc_references(_download(POC_TARBALL_URL, work_dir)))
-
-        release = json.loads(_http_get(CVELIST_RELEASE_API))
-        assets = [asset["browser_download_url"] for asset in release["assets"]]
-        bulk = next(url for url in assets if "all_CVEs_at_midnight" in url)
-        cvelist = _download(bulk, work_dir)
-        # the hourly delta of the same release adds what changed since midnight
-        changes = next((url for url in assets if "_delta_CVEs_at_" in url), None)
-        delta = _download(changes, work_dir) if changes else None
-
-        # a stale CVE List would publish a dataset that misses the newest CVEs: fail instead
-        newest = max(
-            (record.get("cveMetadata", {}).get("datePublished") or "")
-            for path in filter(None, (cvelist, delta))
-            for record in iter_cve_records(path)
-        )
-        age = time.time() - calendar.timegm(time.strptime(newest[:19], "%Y-%m-%dT%H:%M:%S"))
-        if age > 36 * 3600:
-            print(f"[-] The CVE List is stale: its newest CVE was published at {newest}", file=sys.stderr)
-            return 1
 
         print("[+] Mining community names", file=sys.stderr)
         descriptions = {cve_id: text for cve_id, text, _ in iter_cvelist(cvelist, delta)}
