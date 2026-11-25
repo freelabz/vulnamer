@@ -17,6 +17,7 @@ description, so they are returned separately as ``VulnName.public_name``.
 from __future__ import annotations
 
 import argparse
+import calendar
 import gzip
 import hashlib
 import importlib.util
@@ -1026,8 +1027,8 @@ def parse_cve_record(record: dict) -> Optional[Tuple[str, str, str]]:
     return metadata["cveId"], chosen.strip(), _collapse(cna.get("title") or "")
 
 
-def iter_cvelist(path: str) -> Iterator[Tuple[str, str, str]]:
-    """Read a cvelistV5 bulk archive, which may be a zip nested in a zip."""
+def iter_cve_records(path: str) -> Iterator[dict]:
+    """Read the CVE JSON 5 records of a cvelistV5 archive, which may be a zip nested in a zip."""
     with zipfile.ZipFile(path) as outer:
         archive = outer
         inner = [name for name in outer.namelist() if name.endswith(".zip")]
@@ -1037,11 +1038,27 @@ def iter_cvelist(path: str) -> Iterator[Tuple[str, str, str]]:
             if not name.endswith(".json") or "/CVE-" not in name:
                 continue
             try:
-                parsed = parse_cve_record(json.loads(archive.read(name)))
+                yield json.loads(archive.read(name))
             except ValueError:
                 continue
+
+
+def iter_cvelist(path: str, delta: Optional[str] = None) -> Iterator[Tuple[str, str, str]]:
+    """Read the published CVEs of a cvelistV5 bulk archive.
+
+    ``delta`` is a delta archive of the same release (changes since that midnight): its
+    records replace the bulk ones with the same CVE ID, and one that is no longer published
+    (REJECTED) drops the CVE, like the bulk archive does.
+    """
+    updates = {}
+    for record in iter_cve_records(delta) if delta else ():
+        updates[record.get("cveMetadata", {}).get("cveId")] = parse_cve_record(record)
+    for record in iter_cve_records(path):
+        if record.get("cveMetadata", {}).get("cveId") not in updates:
+            parsed = parse_cve_record(record)
             if parsed:
                 yield parsed
+    yield from (parsed for parsed in updates.values() if parsed)
 
 
 def iter_ghsa_summaries(path: str) -> Iterator[Tuple[str, str]]:
@@ -1307,9 +1324,23 @@ def _build_command(args: argparse.Namespace) -> int:
         assets = [asset["browser_download_url"] for asset in release["assets"]]
         bulk = next(url for url in assets if "all_CVEs_at_midnight" in url)
         cvelist = _download(bulk, work_dir)
+        # the hourly delta of the same release adds what changed since midnight
+        changes = next((url for url in assets if "_delta_CVEs_at_" in url), None)
+        delta = _download(changes, work_dir) if changes else None
+
+        # a stale CVE List would publish a dataset that misses the newest CVEs: fail instead
+        newest = max(
+            (record.get("cveMetadata", {}).get("datePublished") or "")
+            for path in filter(None, (cvelist, delta))
+            for record in iter_cve_records(path)
+        )
+        age = time.time() - calendar.timegm(time.strptime(newest[:19], "%Y-%m-%dT%H:%M:%S"))
+        if age > 36 * 3600:
+            print(f"[-] The CVE List is stale: its newest CVE was published at {newest}", file=sys.stderr)
+            return 1
 
         print("[+] Mining community names", file=sys.stderr)
-        descriptions = {cve_id: text for cve_id, text, _ in iter_cvelist(cvelist)}
+        descriptions = {cve_id: text for cve_id, text, _ in iter_cvelist(cvelist, delta)}
         public_names = mine_public_names(references, descriptions)
         del descriptions
 
@@ -1319,7 +1350,7 @@ def _build_command(args: argparse.Namespace) -> int:
         names = gzip.open(args.names, "wt", encoding="utf-8") if args.names else None
         with gzip.open(args.output, "wt", encoding="utf-8") as output:
             for result in build_dataset(
-                iter_cvelist(cvelist), nuclei, kev, ghsa, public_names, namer, previous
+                iter_cvelist(cvelist, delta), nuclei, kev, ghsa, public_names, namer, previous
             ):
                 output.write(json.dumps(result, ensure_ascii=False) + "\n")
                 reduced = names_entry(result)

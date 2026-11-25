@@ -328,6 +328,82 @@ class TestParsers(unittest.TestCase):
                 outer.writestr("cves.zip", inner.getvalue())
             self.assertEqual(list(V.iter_cvelist(path)), [("CVE-1", "Foo", "")])
 
+    def _cve(self, cve_id, description, state="PUBLISHED", published="2026-11-24T10:00:00.000Z"):
+        return {
+            "cveMetadata": {"state": state, "cveId": cve_id, "datePublished": published},
+            "containers": {"cna": {"descriptions": [{"lang": "en", "value": description}]}},
+        }
+
+    def _zip(self, directory, name, records):
+        path = os.path.join(directory, name)
+        with zipfile.ZipFile(path, "w") as archive:
+            for record in records:
+                archive.writestr(f"deltaCves/{record['cveMetadata']['cveId']}.json", json.dumps(record))
+        return path
+
+    def test_delta_overrides_bulk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bulk = self._zip(
+                directory,
+                "bulk.zip",
+                [self._cve("CVE-1", "Old"), self._cve("CVE-2", "Kept"), self._cve("CVE-3", "Withdrawn")],
+            )
+            delta = self._zip(
+                directory,
+                "delta.zip",
+                [self._cve("CVE-1", "New"), self._cve("CVE-4", "Today"), self._cve("CVE-3", "", "REJECTED")],
+            )
+            self.assertEqual(
+                sorted(V.iter_cvelist(bulk, delta)),
+                [("CVE-1", "New", ""), ("CVE-2", "Kept", ""), ("CVE-4", "Today", "")],
+            )
+            # without a delta the bulk archive is read as is
+            self.assertEqual([cve[0] for cve in V.iter_cvelist(bulk)], ["CVE-1", "CVE-2", "CVE-3"])
+
+    def test_delta_rejected_cve_not_in_bulk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bulk = self._zip(directory, "bulk.zip", [self._cve("CVE-1", "Foo")])
+            delta = self._zip(directory, "delta.zip", [self._cve("CVE-2", "", "REJECTED")])
+            self.assertEqual(list(V.iter_cvelist(bulk, delta)), [("CVE-1", "Foo", "")])
+
+    def _build(self, directory, published):
+        bulk = self._zip(directory, "bulk.zip", [self._cve("CVE-1", "Foo", published="2026-11-23T10:00:00Z")])
+        delta = self._zip(directory, "delta.zip", [self._cve("CVE-2", "Bar", published=published)])
+        release = {
+            "assets": [
+                {"browser_download_url": "https://x/2026-11-24_all_CVEs_at_midnight.zip.zip"},
+                {"browser_download_url": "https://x/2026-11-24_delta_CVEs_at_1200Z.zip"},
+            ]
+        }
+        responses = {V.NUCLEI_CVES_URL: b"", V.KEV_URL: b"{}", V.CVELIST_RELEASE_API: json.dumps(release).encode()}
+        downloads = {release["assets"][0]["browser_download_url"]: bulk, release["assets"][1]["browser_download_url"]: delta}
+        output = os.path.join(directory, "out.jsonl.gz")
+        args = mock.Mock(output=output, names=None, model=None, previous=None, threads=None)
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(V, "_http_get", side_effect=responses.__getitem__),
+            mock.patch.object(V, "_download", side_effect=lambda url, _: downloads.get(url, "")),
+            mock.patch.object(V, "iter_ghsa_summaries", return_value=[]),
+            mock.patch.object(V, "iter_poc_references", return_value=[]),
+            mock.patch.object(V.time, "time", return_value=1795608000),  # 2026-11-25T12:00:00Z
+            redirect_stderr(stderr),
+        ):
+            code = V._build_command(args)
+        return code, output, stderr.getvalue()
+
+    def test_build_reads_the_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _ = self._build(directory, "2026-11-25T01:00:00.000Z")
+            self.assertEqual(code, 0)
+            self.assertEqual(sorted(row["id"] for row in V.read_dataset(output).values()), ["CVE-1", "CVE-2"])
+
+    def test_build_fails_on_a_stale_cve_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, stderr = self._build(directory, "2026-11-23T23:00:00.000Z")
+            self.assertEqual(code, 1)
+            self.assertIn("stale", stderr)
+            self.assertFalse(os.path.exists(output))
+
     def _tarball(self, directory, files):
         path = os.path.join(directory, "data.tar.gz")
         with tarfile.open(path, "w:gz") as archive:
