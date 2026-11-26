@@ -1,7 +1,12 @@
 name: Update names dataset
 on:
+  # Twice a day, so a late or failed run still leaves the dataset at most a day behind:
+  # 07:05 and 14:05 Paris in winter (08:05 and 15:05 in summer). The :05 offset avoids the
+  # top-of-hour congestion that delays scheduled runs. Each run builds from the latest
+  # cvelistV5 release: the midnight snapshot plus that release's delta since midnight.
   schedule:
-    - cron: "15 1 * * *"
+    - cron: "5 6 * * *"
+    - cron: "5 13 * * *"
   workflow_dispatch:
     inputs:
       bootstrap:

@@ -27,7 +27,7 @@ not be available yet on the newest Python release. The base package has no such 
 ## Three ways to use it
 
 **Use the dataset.** This is the simplest option and needs no ML dependencies. The
-dataset is one JSON object per line, rebuilt nightly and published at
+dataset is one JSON object per line, rebuilt twice a day and published at
 `vulnamer.DATASET_URL`:
 
 ```json
@@ -239,7 +239,8 @@ findings on it, so published names are **append-only**:
 
 The nightly fails rather than publish a dataset that breaks this: it requires the previous
 release files, checks both the full and the names file with `check-stable`, and never runs
-two builds at once. Building from scratch needs a manual run with `bootstrap=true`.
+two builds at once. Building from scratch needs a manual run with `bootstrap=true`. It also
+fails when the newest CVE in the CVE List it read was published more than 36 hours earlier.
 
 The names file (`vuln_names.min.jsonl.gz`, one `{"id", "name", "public_name"}` object per
 line, empty keys omitted) is a stable contract. Each nightly release also carries
